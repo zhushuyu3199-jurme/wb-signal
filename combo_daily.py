@@ -38,7 +38,7 @@ import os
 import re
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -413,15 +413,162 @@ def save_state(today, idx955, idx922, fund, etf, pushed, prev):
     json.dump(st, open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
 
+# ================== 盘中巡检模式（v2） ==================
+BJ_TZ = timezone(timedelta(hours=8))
+INTRADAY_LEVELS_IDX = ("DCA", "BUY1", "BUY2", "SELL")        # 红利类盘中预警档位
+INTRADAY_LEVELS_FUND = ("STRONG", "BUY")                     # 金利盘中预警档位
+INTRADAY_LEVELS_ETF = ("BUBBLE", "DIP1", "DIP2", "DIP3")     # 纳指ETF盘中预警档位
+
+
+def bj_now():
+    return datetime.now(BJ_TZ)
+
+
+def is_trading_time(t):
+    if t.weekday() >= 5:
+        return False
+    hm = t.hour * 100 + t.minute
+    return (930 <= hm <= 1135) or (1255 <= hm <= 1505)
+
+
+def mode_of_now():
+    """auto 分流: 交易时段->intraday; 盘中窗口边界->silent; 其余->evening"""
+    t = bj_now()
+    if is_trading_time(t):
+        return "intraday"
+    hm = t.hour * 100 + t.minute
+    if t.weekday() < 5 and 830 <= hm <= 1600:
+        return "silent"
+    return "evening"
+
+
+def _intraday_snapshot_signal(hist_path, code, label):
+    """以「历史库 + 今日盘中价」在内存中重算指数信号（不落盘）。"""
+    snap = fetch_index_snapshot(code)
+    h = json.load(open(hist_path, encoding="utf-8"))
+    ds, cs = h["dates"][:], h["closes"][:]
+    if ds and ds[-1] == snap["date"]:
+        cs[-1] = snap["close"]
+    else:
+        ds.append(snap["date"])
+        cs.append(snap["close"])
+    return signal_for(cs, ds, label=label), snap["date"]
+
+
+def intraday_run(args):
+    """盘中巡检：仅在触发档位时推送（同日同档位去重）；不写任何历史数据文件。"""
+    errors, trig = [], []
+    today = None
+
+    try:
+        sig, d = _intraday_snapshot_signal(HIST_IDX, "cs930955", "cs930955")
+        if sig.get("level") in INTRADAY_LEVELS_IDX:
+            trig.append(("955:%s" % sig["level"], "红利低波100",
+                         "- 红利低波100 最新 %.2f，偏离250日线 %+.2f%%（%s）→ %s"
+                         % (sig["close"], sig["pct"], sig["zone"], sig["action"])))
+        today = d
+    except Exception as e:
+        errors.append("红利低波100: %s" % e)
+
+    try:
+        sig, d = _intraday_snapshot_signal(HIST_922, "sh000922", "sh000922")
+        if sig.get("level") in INTRADAY_LEVELS_IDX:
+            trig.append(("922:%s" % sig["level"], "中证红利",
+                         "- 中证红利 最新 %.2f，偏离250日线 %+.2f%%（%s）→ %s"
+                         % (sig["close"], sig["pct"], sig["zone"], sig["action"])))
+        today = today or d
+    except Exception as e:
+        errors.append("中证红利: %s" % e)
+
+    try:
+        rows = fetch_kline_rows("sz160128", 150)
+        try:
+            nav_info = fetch_fund_nav("160128")
+        except Exception:
+            nav_info = dict(date=None, nav=None)
+        if nav_info.get("nav"):
+            fs = fund_signal(rows, nav_info)
+            if fs["level"] in INTRADAY_LEVELS_FUND:
+                if fs["discount"] is not None and fs["discount"] > 0:
+                    dtxt = "折价率 %+.2f%%（市价低于净值）" % fs["discount"]
+                else:
+                    dtxt = "价格类信号触发"
+                trig.append(("160128:%s" % fs["level"], "南方金利定开",
+                             "- 南方金利定开 %s → %s" % (dtxt, fs["action"])))
+        today = today or rows[-1]["date"]
+    except Exception as e:
+        errors.append("南方金利定开: %s" % e)
+
+    try:
+        prows = fetch_kline_rows("sh513300", 500)
+        navobj = json.load(open(NAV_513300, encoding="utf-8"))  # 只读，不更新
+        et = etf513300_signal(prows, navobj["dates"], navobj["closes"])
+        if et["level"] in INTRADAY_LEVELS_ETF:
+            trig.append(("513300:%s" % et["level"], "纳指ETF",
+                         "- 纳指ETF 价格 %.3f，净值偏离 %+.2f%%，距高点回撤 %+.2f%% → %s"
+                         % (et["price"], et["nav_dev"], et["nav_dd"], et["action"])))
+        today = today or et["date"]
+    except Exception as e:
+        errors.append("纳斯达克ETF: %s" % e)
+
+    if today is None:
+        print(json.dumps({"ok": True, "mode": "intraday", "note": "全部数据源暂不可用，静默", "errors": errors},
+                         ensure_ascii=False))
+        return
+
+    prev = load_state()
+    it = prev.get("intraday") or {}
+    pushed = set(it.get("levels") or []) if it.get("date") == today else set()
+    newt = [t for t in trig if t[0] not in pushed]
+    if not newt:
+        print(json.dumps({"ok": True, "mode": "intraday", "date": today,
+                          "skipped": "无新触发（或已推过）", "errors": errors}, ensure_ascii=False))
+        return
+
+    names = "、".join(t[1] for t in newt)
+    title = "⚠️盘中预警｜%s %s" % (names, today[5:])
+    L = ["**【盘中快照 · 非收盘确认】北京时间 %s**" % bj_now().strftime("%H:%M"),
+         "（盘中数据触发，收盘可能回落失效；最终以当晚日报为确认）", ""]
+    L += [t[2] for t in newt]
+    L += ["", "—— 系统自动推送 · 不构成投资建议"]
+    content = "\n".join(L)
+
+    res = push(title, content, dry=args.no_push)
+    if res.get("ok") and not args.no_push:
+        if (prev.get("intraday") or {}).get("date") != today:
+            prev["intraday"] = {"date": today, "levels": []}
+        prev["intraday"]["levels"] = sorted(pushed | {t[0] for t in newt})
+        prev["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        json.dump(prev, open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print(json.dumps({"ok": bool(res.get("ok")) or args.no_push, "mode": "intraday", "title": title,
+                      "triggered": [t[0] for t in newt], "push_res": res, "errors": errors},
+                     ensure_ascii=False, indent=2))
+
+
 # ---------- 主流程 ----------
 def main():
-    ap = argparse.ArgumentParser(description="四标的合并信号日报")
+    ap = argparse.ArgumentParser(description="四标的合并信号日报（晚间/盘中双模式）")
     ap.add_argument("--no-push", action="store_true", help="只算不发")
     ap.add_argument("--force", action="store_true", help="忽略非新交易日抑制")
+    ap.add_argument("--mode", choices=["auto", "intraday", "evening"], default="evening",
+                    help="auto=按北京时间自动分流(云端定时用); intraday=盘中巡检(触发才推); evening=晚间日报(默认)")
     ap.add_argument("--index-close", type=float, default=None, help="兜底: 手动传红利低波100收盘")
     ap.add_argument("--index-date", default=None, help="兜底: 手动传红利低波100日期")
     args = ap.parse_args()
 
+    mode = args.mode
+    if mode == "auto":
+        mode = mode_of_now()
+    if mode == "silent":
+        print(json.dumps({"ok": True, "mode": "silent", "reason": "盘中窗口边界时段，静默"}, ensure_ascii=False))
+        return
+    if mode == "intraday":
+        intraday_run(args)
+        return
+    evening_run(args)
+
+
+def evening_run(args):
     errors = []
 
     # 1) 红利低波100

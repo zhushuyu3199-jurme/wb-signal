@@ -1,0 +1,397 @@
+# -*- coding: utf-8 -*-
+"""
+组合监测 · 主程序 v2
+================================
+一天两次：北京时间 12:30（午间快照）/ 22:00（完整版）
+
+用法：
+  python run_daily.py                     # 按当前时间自动判断
+  python run_daily.py --mode night --dry  # 只打印不推送
+  python run_daily.py --set-hk-yield 5.6  # 录入港股通红利股息率
+  python run_daily.py --set-shiller 36.2  # 录入标普500 席勒PE
+"""
+import argparse, json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config as C
+import indicators as I
+import push_notify as P
+
+
+def f1(v, s=""):
+    return "—" if v is None else "%.1f%s" % (v, s)
+
+
+def f2(v, s=""):
+    return "—" if v is None else "%.2f%s" % (v, s)
+
+
+def sg(v, s="%"):
+    return "—" if v is None else "%+.2f%s" % (v, s)
+
+
+def target_weights(erp_target):
+    if erp_target is None:
+        erp_target = C.EQUITY_BASE
+    scale = erp_target / C.EQUITY_BASE
+    w = {k: C.ASSET_BY_KEY[k]["weight"] * scale for k in ("a500", "hk_div", "sp500")}
+    w["gold"] = C.ASSET_BY_KEY["gold"]["weight"]
+    w["short_bond"] = 1.0 - sum(w.values())
+    if w["short_bond"] < 0.05:
+        excess = 0.05 - w["short_bond"]
+        eq = sum(w[k] for k in ("a500", "hk_div", "sp500"))
+        for k in ("a500", "hk_div", "sp500"):
+            w[k] -= excess * w[k] / eq
+        w["short_bond"] = 0.05
+    return w
+
+
+def gather():
+    codes = [a["etf"] for a in C.ASSETS]
+    try:
+        quotes = I.fetch_quotes(codes)
+    except Exception as e:
+        quotes = {}
+        print("[warn] 行情失败: %s" % e)
+    get = lambda k: quotes.get(C.ASSET_BY_KEY[k]["etf"].lstrip("shsz"))
+    erp = I.calc_erp()
+
+    def safe(fn, *a):
+        try:
+            r = fn(*a)
+            r["ok"] = True
+            return r
+        except Exception as ex:
+            return {"ok": False, "err": "%s: %s" % (type(ex).__name__, ex)}
+
+    return {
+        "erp": erp,
+        "a500": I.calc_a500(),
+        "hk": I.calc_hk_div(erp.get("bond") if erp.get("ok") else None),
+        "sp": I.calc_sp500(get("sp500")) if get("sp500") else {"ok": False, "err": "无行情"},
+        "sb": I.calc_short_bond(),
+        "gold": I.calc_gold(),
+        "reb": I.calc_rebalance(),
+        "dxy": safe(I.calc_dxy),
+        "sbx": safe(I.calc_southbound),
+    }
+
+
+def legacy_blocks():
+    """原四标的：复用 combo_daily 的信号引擎，输出精简块"""
+    import combo_daily as L
+    out = []
+    p1, p2, p3, p4 = [x["pit_short"] for x in C.LEGACY]
+
+    # 红利低波100
+    try:
+        h = json.load(open(L.HIST_IDX, encoding="utf-8"))
+        snap = L.fetch_index_snapshot("cs930955")
+        L.merge_hist(h, snap["date"], snap["close"])
+        json.dump(h, open(L.HIST_IDX, "w", encoding="utf-8"), ensure_ascii=False)
+        idx = L.signal_for(h["closes"], h["dates"], label="cs930955")
+        out += ["", "**⑥ 红利低波100（cs930955）· 250日均线档位**",
+                "偏离 **%+.2f%%**（%s）→ %s" % (idx["pct"], idx["zone"], idx["action"]),
+                "⚠ " + p1]
+    except Exception as e:
+        out += ["", "**⑥ 红利低波100**：取数失败（%s）" % e]
+
+    # 中证红利
+    try:
+        h = json.load(open(L.HIST_922, encoding="utf-8"))
+        snap = L.fetch_index_snapshot("sh000922")
+        L.merge_hist(h, snap["date"], snap["close"])
+        json.dump(h, open(L.HIST_922, "w", encoding="utf-8"), ensure_ascii=False)
+        idx = L.signal_for(h["closes"], h["dates"], label="sh000922")
+        out += ["", "**⑦ 中证红利（sh000922）· 250日均线档位**",
+                "偏离 **%+.2f%%**（%s）→ %s" % (idx["pct"], idx["zone"], idx["action"]),
+                "⚠ " + p2]
+    except Exception as e:
+        out += ["", "**⑦ 中证红利**：取数失败（%s）" % e]
+
+    # 南方金利
+    try:
+        rows = L.fetch_kline_rows("sz160128", 150)
+        try:
+            nav_info = L.fetch_fund_nav("160128")
+        except Exception:
+            nav_info = dict(date=None, nav=None)
+        if nav_info.get("nav"):
+            f = L.fund_signal(rows, nav_info)
+            disc = ("折价 **%+.2f%%**" % f["discount"]) if f["discount"] is not None else "折价 —"
+        else:
+            f = L.fund_signal(rows, dict(date="缺", nav=rows[-1]["close"]))
+            f.update(nav=None, nav_date=None, discount=None, disc_gap=None)
+            disc = "净值暂缺"
+        out += ["", "**⑧ 南方金利定开（160128）· 折价率**",
+                "%s ｜ 20日偏离 %+.2f%% ｜ 新低20/40：%s/%s" %
+                (disc, f["dev20"], "是" if f["new20"] else "否", "是" if f["new40"] else "否"),
+                "→ %s" % f["action"], "⚠ " + p3]
+    except Exception as e:
+        out += ["", "**⑧ 南方金利定开**：取数失败（%s）" % e]
+
+    # 纳指ETF
+    try:
+        prows = L.fetch_kline_rows("sh513300", 500)
+        nds, ncs, _ = L.update_nav_lib(L.NAV_513300, "513300")
+        e = L.etf513300_signal(prows, nds, ncs)
+        out += ["", "**⑨ 纳指ETF华夏（513300）· 泡沫止盈+回撤加仓**",
+                "价格 **%.3f** ｜ 溢价 **%+.2f%%** ｜ 净值回撤 %+.2f%%" %
+                (e["price"], e["premium"], e["nav_dd"]),
+                "→ %s ｜ 溢价：%s" % (e["action"], e["prem_act"]), "⚠ " + p4]
+    except Exception as e:
+        out += ["", "**⑨ 纳指ETF华夏**：取数失败（%s）" % e]
+    return out
+
+
+def build(d, mode):
+    now = I.now_bj()
+    night = (mode == "night")
+    L = []
+    L.append("**%s · %s**　%s" % (C.PUSH_TITLE_PREFIX,
+                                  "夜间完整版" if night else "午间快照",
+                                  now.strftime("%m-%d %H:%M")))
+
+    # 总开关
+    e = d["erp"]
+    L.append("")
+    L.append("**◆ 总开关｜ERP 决定总仓位**")
+    if e.get("ok"):
+        L.append("ERP **%s** → 权益 **%d%%**（%s）" %
+                 (f2(e["erp"], "%"), round(e["target"] * 100), e["label"]))
+        L.append("　PE %s（%s）｜10年国债 %s" % (f2(e["pe"]), e["pe_src"], f2(e["bond"], "%")))
+    else:
+        L.append("取数失败：%s" % e.get("err"))
+
+    w = target_weights(e.get("target") if e.get("ok") else None)
+    L.append("")
+    L.append("**◆ 本期目标权重**")
+    L.append("　" + " ｜ ".join("%s %d%%" % (C.ASSET_BY_KEY[k]["name"], round(w[k] * 100))
+                              for k in ("a500", "hk_div", "sp500", "short_bond", "gold")))
+
+    # ① A500
+    a = d["a500"]
+    L.append("")
+    L.append("**① 中证A500（512050）· 锚：估值分位**")
+    if a.get("ok"):
+        tag = "（%s代理）" % a["src"] if a["proxy"] else ""
+        L.append("PE分位 **%s**%s ｜ PB分位 **%s** ｜ 取低 **%s**（%s）" %
+                 (f1(a["pct_pe"], "%"), tag, f1(a["pb_pct"], "%"),
+                  f1(a["pct"], "%"), a["basis"]))
+        amt = "（%s元）" % format(int(a["amount"]), ",") if a.get("amount") else ""
+        L.append("→ **%s %.1f×**%s" % (a["action"], a["mult"], amt))
+    else:
+        L.append("→ 取数失败：%s" % a.get("err"))
+    L.append("⚠ " + C.A500["pit_short"])
+
+    # ② 港股通红利
+    h = d["hk"]
+    L.append("")
+    L.append("**② 港股通红利（159569）· 锚：股息率−无风险利率**")
+    if h.get("ok"):
+        stale = "（数据%d天前）" % h["age"] if h.get("stale") else ""
+        line = ("股息率 **%s**%s ｜ 到手≈%s ｜ 利差 %s" %
+                (f2(h["value"], "%"), stale, f2(h["net"], "%"),
+                 f1(h["spread"], "pp") if h["spread"] is not None else "—"))
+        sb = d.get("sbx") or {}
+        if sb.get("ok"):
+            tail = "连续买入%d日" % sb["streak_buy"] if sb["streak_buy"] else "连续卖出"
+            line += " ｜ 南向5日 **%+.0f亿**（%s）" % (sb["sum"], tail)
+        L.append(line)
+        L.append("→ **%s**" % h["zone"])
+    else:
+        L.append("股息率 —（未录入）")
+        L.append("→ **待录入**：--set-hk-yield 你的数值")
+    L.append("⚠ " + C.HK_DIV["pit_short"])
+
+    # ③ 标普500
+    s = d["sp"]
+    L.append("")
+    L.append("**③ 标普500（513500）· 锚：溢价率**")
+    if s.get("ok"):
+        shv, exp8 = s.get("shiller"), s.get("exp8")
+        sht = f1(shv)
+        if exp8 is not None:
+            sht += "（8年预期年化 %s）" % f1(exp8, "%")
+        L.append("溢价 **%s**（T-1净值）｜ 席勒PE **%s**" % (sg(s["prem"]), sht))
+        L.append("PE %s（分位%s）%s" %
+                 (f1(s["pe"]), f1(s["pe_pct"], "%"),
+                  " ｜ 席勒PE>35 属警戒区" if (shv or 0) > 35 else ""))
+        L.append("→ **%s**" % s["action"])
+        if s["prem"] >= 1.5:
+            L.append("　※ 下单前必须核实实时 IOPV")
+    else:
+        L.append("→ 取数失败：%s" % s.get("err"))
+    L.append("⚠ " + C.SP500["pit_short"])
+
+    # ④ 短融
+    b = d["sb"]
+    L.append("")
+    L.append("**④ 短融（511360）· 锚：资金面，不择时**")
+    if b.get("ok"):
+        fund_rate = []
+        if b.get("gc007"):
+            fund_rate.append("GC007 %s" % f2(b["gc007"], "%"))
+        if b.get("shibor"):
+            fund_rate.append("Shibor1W %s" % f2(b["shibor"], "%"))
+        L.append("7日年化 **%s** ｜ 资金面 %s ｜ 窗口：%s" %
+                 (f2(b["ann"], "%"),
+                  " / ".join(fund_rate) or "—", b.get("window") or "无"))
+        if b.get("lock"):
+            L.append("→ **7日年化≥%.1f%%，可锁定**" % C.SHORT_BOND["lock_yield"])
+        elif b.get("window"):
+            L.append("→ **%s资金面，闲钱可多买一点**" % b["window"])
+        else:
+            L.append("→ **正常持有，不动**")
+    else:
+        L.append("→ 取数失败：%s" % b.get("err"))
+    L.append("⚠ " + C.SHORT_BOND["pit_short"])
+
+    # ⑤ 黄金
+    g = d["gold"]
+    L.append("")
+    L.append("**⑤ 黄金（518880）· 锚：美国实际利率**")
+    if g.get("ok"):
+        dx = d.get("dxy") or {}
+        l1 = "TIPS **%s**（20日 %s）" % (f2(g["tips"], "%"), sg(g["tips_chg20"], "pp"))
+        if dx.get("ok"):
+            l1 += " ｜ 美元 **%s**（%s）" % (f2(dx["value"]), dx["zone"])
+        L.append(l1)
+        L.append("距250日高 **%s** ｜ 60日 %s ｜ TIPS日期 %s" %
+                 (sg(g["dd"]), sg(g["chg60"]), g["tips_date"]))
+        if g.get("spike"):
+            L.append("→ **60日涨超%.0f%%，先减一部分**" % C.GOLD["spike_cut"])
+        elif g.get("trigger"):
+            L.append("→ **实际利率下行 + 回撤深，可加**")
+        else:
+            L.append("→ **%s**" % g["label"])
+    else:
+        L.append("→ 取数失败：%s" % g.get("err"))
+    L.append("⚠ " + C.GOLD["pit_short"])
+
+    # 原持仓标的
+    try:
+        lg = legacy_blocks()
+    except Exception:
+        lg = []
+    if lg:
+        L.append("")
+        L.append("**◆ 原持仓标的（延续监控）**")
+        L.extend(lg)
+
+    # 今日动作
+    acts = []
+    if a.get("ok"):
+        if a["mult"] >= 2:
+            acts.append("A500 %s，本月 %.1f×" % (a["action"], a["mult"]))
+        elif a["mult"] == 0:
+            acts.append("A500 停投，钱转短融/减仓")
+        elif a["mult"] < 1:
+            acts.append("A500 定投减半")
+    if h.get("ok") and h["zone"] in ("重仓加", "减半", "减到三成", "清仓"):
+        acts.append("港股通红利：%s" % h["zone"])
+    if s.get("ok") and s["prem"] >= 1.5:
+        acts.append("标普500：%s" % s["action"])
+    if b.get("ok") and b.get("lock"):
+        acts.append("短融：年化≥2.5%，可锁定")
+    if g.get("ok") and (g.get("spike") or g.get("trigger")):
+        acts.append("黄金：%s" % ("减一部分" if g["spike"] else "可加"))
+
+    L.append("")
+    L.append("**◆ 今日动作**")
+    if acts:
+        for x in acts:
+            L.append("· " + x)
+    else:
+        L.append("· 无操作 —— 按计划执行即可")
+
+    if night:
+        r = d["reb"]
+        if r.get("in_window"):
+            L.append("")
+            L.append("**◆ 再平衡窗口（12月最后一周）**")
+            if r.get("ok"):
+                for row in r["rows"]:
+                    L.append("· %s 现%.0f%% / 目标%.0f%%%s" %
+                             (row["name"], row["cur"] * 100, row["tgt"] * 100,
+                              " ⚠" if row["alert"] else ""))
+                L.append("　先用新钱补低配，尽量不卖高配")
+            else:
+                L.append("· " + (r.get("err") or "未配置"))
+
+        bad = [n for k, n in (("erp", "ERP"), ("a500", "A500"), ("hk", "港股通红利"),
+                              ("sp", "标普500"), ("sb", "短融"), ("gold", "黄金"),
+                              ("dxy", "美元指数"), ("sbx", "南向资金"))
+               if not d[k].get("ok")]
+        if bad:
+            L.append("")
+            L.append("**◆ 数据异常**：%s（显示「—」，其余不受影响）" % "、".join(bad))
+        L.append("")
+        L.append("---")
+        L.append("*五个标的锚不同：估值分位 / 股息利差 / 溢价率 / 资金面 / 实际利率*")
+        L.append("*指标只回答「买多少」，不回答「何时涨」*")
+
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["auto", "noon", "night"], default="auto")
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--set-hk-yield", type=float, default=None)
+    ap.add_argument("--set-shiller", type=float, default=None)
+    args = ap.parse_args()
+
+    if args.set_hk_yield is not None:
+        m = I.load_manual()
+        m["hk_yield"] = {"value": args.set_hk_yield, "asof": I.now_bj().strftime("%Y-%m-%d")}
+        I.save_manual(m)
+        print("已更新港股通红利股息率：%.2f%%（%s）" % (args.set_hk_yield, m["hk_yield"]["asof"]))
+        return 0
+    if args.set_shiller is not None:
+        m = I.load_manual()
+        m["shiller_pe"] = {"value": args.set_shiller, "asof": I.now_bj().strftime("%Y-%m-%d")}
+        I.save_manual(m)
+        print("已更新标普500 席勒PE：%.1f" % args.set_shiller)
+        return 0
+
+    now = I.now_bj()
+    if now.weekday() >= 5 and not args.force:
+        print("周末休市，跳过（--force 强制）")
+        return 0
+
+    mode = args.mode
+    if mode == "auto":
+        hh = now.hour + now.minute / 60.0
+        mode = "noon" if 11.0 <= hh < 15.0 else "night"
+
+    msg = build(gather(), mode)
+    print(msg)
+    if args.dry:
+        return 0
+
+    title = "%s %s %s" % (C.PUSH_TITLE_PREFIX, "午间" if mode == "noon" else "夜间",
+                          now.strftime("%m-%d"))
+    try:
+        cfg = P.load_config()
+        ch = cfg.get("channel", "pushplus")
+        if ch == "pushplus":
+            token = os.environ.get("PUSHPLUS_TOKEN") or cfg.get("pushplus_token", "")
+            if not token:
+                print('{"ok": false, "error": "缺少 PUSHPLUS_TOKEN"}')
+                return 2
+            resp = P.send_pushplus(token, title, msg)
+        else:
+            resp = P.send_serverchan(os.environ.get("SERVERCHAN_KEY") or cfg.get("serverchan_key", ""),
+                                     title, msg)
+        print('{"ok": true, "resp": %s}' % resp)
+    except Exception as ex:
+        print('{"ok": false, "error": "%s"}' % ex)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

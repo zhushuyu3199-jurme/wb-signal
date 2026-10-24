@@ -1,46 +1,48 @@
-name: Daily Signal Report
+name: Portfolio Monitor
 
 on:
-  # 每日定时运行：UTC 14:00 = 北京时间 22:00
-  # 如需改时间：换算成 UTC 后修改下面的 cron（例：北京时间 08:00 = UTC 00:00 => "0 0 * * *"）
   schedule:
-    - cron: "*/30 1-7 * * 1-5"
-    - cron: "0 14 * * *"
-  # 允许在 Actions 页面手动触发（首次验证用）
+    # 北京时间 12:00 = UTC 04:00
+    - cron: "0 4 * * 1-5"
+    # 北京时间 22:00 = UTC 14:00
+    - cron: "0 14 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "强制运行（忽略周末休市，手动测试用）"
+        type: boolean
+        default: true
 
 permissions:
-  contents: write   # 允许把更新后的数据提交回仓库
+  contents: write
 
 concurrency:
-  group: daily
+  group: monitor
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: 取回仓库
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 准备 Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 运行信号日报
+      - name: 运行组合监测
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python combo_daily.py --mode auto
+        run: python run_daily.py --mode auto ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
 
-      - name: 提交数据更新
+      - name: 回写数据（分红库/净值库/手动值）
         run: |
-          git config user.name "signal-bot"
-          git config user.email "signal-bot@users.noreply.github.com"
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "无数据变化，跳过提交"
+            echo "无变化"
           else
             git commit -m "data update: $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push

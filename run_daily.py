@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-组合监测 · 主程序 v2
+定盘 · 主程序
 ================================
 一天两次：北京时间 12:30（午间快照）/ 22:00（完整版）
 
@@ -190,7 +190,7 @@ def build(d, mode):
     L.append("")
     L.append("**② 港股通红利（159569）· 锚：股息率−无风险利率**")
     if h.get("ok"):
-        stale = "（数据%d天前）" % h["age"] if h.get("stale") else ""
+        stale = "（⚠️已%d天未更新）" % h["age"] if h.get("stale") else ""
         line = ("股息率 **%s**%s ｜ 到手≈%s ｜ 利差 %s" %
                 (f2(h["value"], "%"), stale, f2(h["net"], "%"),
                  f1(h["spread"], "pp") if h["spread"] is not None else "—"))
@@ -297,6 +297,9 @@ def build(d, mode):
         acts.append("短融：年化≥2.5%，可锁定")
     if g.get("ok") and (g.get("spike") or g.get("trigger")):
         acts.append("黄金：%s" % ("减一部分" if g["spike"] else "可加"))
+    if h.get("ok") and h.get("stale"):
+        acts.append("📌 港股通红利：股息率已 **%d 天**未更新，查一次后 --set-hk-yield"
+                    % h["age"])
 
     L.append("")
     L.append("**◆ 今日动作**")
@@ -319,6 +322,18 @@ def build(d, mode):
                 L.append("　先用新钱补低配，尽量不卖高配")
             else:
                 L.append("· " + (r.get("err") or "未配置"))
+
+        maint = []
+        if h.get("ok") and h.get("stale"):
+            maint.append("港股通红利股息率：%d 天前录入（%s），阈值 %d 天"
+                         % (h["age"], h["asof"], C.HK_YIELD_STALE_DAYS))
+        if s.get("ok") and s.get("shiller_src") == "手动":
+            maint.append("标普500 席勒PE：GuruFocus 抓取失败，当前为手动值")
+        if maint:
+            L.append("")
+            L.append("**◆ 待维护**")
+            for x in maint:
+                L.append("· " + x)
 
         bad = [n for k, n in (("erp", "ERP"), ("a500", "A500"), ("hk", "港股通红利"),
                               ("sp", "标普500"), ("sb", "短融"), ("gold", "黄金"),

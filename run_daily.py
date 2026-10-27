@@ -84,7 +84,6 @@ def gather():
         "gold": I.calc_gold(),
         "reb": I.calc_rebalance(),
         "dxy": safe(I.calc_dxy),
-        "sbx": safe(I.calc_southbound),
     }
 
 
@@ -121,37 +120,73 @@ def legacy_blocks():
             nav_info = dict(date=None, nav=None)
         if nav_info.get("nav"):
             f = L.fund_signal(rows, nav_info)
-            disc = ("折价 **%+.2f%%**" % f["discount"]) if f["discount"] is not None else "折价 —"
+            dc = f["discount"]
+            if dc is None:
+                disc = "净值暂缺"
+            elif dc > 0.01:
+                disc = "市价低于净值 **%.2f%%**（折价）" % dc
+            elif dc < -0.01:
+                disc = "市价高于净值 **%.2f%%**（溢价）" % abs(dc)
+            else:
+                disc = "市价≈净值（平价）"
         else:
             f = L.fund_signal(rows, dict(date="缺", nav=rows[-1]["close"]))
             f.update(nav=None, nav_date=None, discount=None, disc_gap=None)
             disc = "净值暂缺"
-        out += ["", "**⑦ 南方金利定开（160128）· 折价率**",
-                "%s ｜ 20日偏离 %+.2f%% ｜ 新低20/40：%s/%s" %
-                (disc, f["dev20"], "是" if f["new20"] else "否", "是" if f["new40"] else "否"),
-                "→ %s" % f["action"], "⚠ " + p1]
+        d2 = "高于" if f["dev20"] >= 0 else "低于"
+        lo = []
+        if f["new20"]:
+            lo.append("20日新低")
+        if f["new40"]:
+            lo.append("40日新低")
+        out += ["", "**⑦ 南方金利定开（160128）· 看折价够不够深**",
+                "%s ｜ %s20日线 %+.2f%% ｜ 新低：%s" %
+                (disc, d2, f["dev20"], "、".join(lo) if lo else "无"),
+                "→ %s" % ("可以买（折价或新低已触发）" if f["level"] in ("BUY", "STRONG")
+                          else "等待：折价不够深、也没创新低，暂不买"),
+                "⚠ " + p1]
     except Exception as e:
         out += ["", "**⑦ 南方金利定开**：取数失败（%s）" % e]
     return out
 
 
+ZONE_CN = {
+    "常态持有区": "正常区间，不用动",
+    "偏热区": "高于年线较多",
+    "极端泡沫区": "远高于年线（极值）",
+    "定投区(-5%~-10%)": "低于年线，可定投",
+    "深度破位(加仓区)": "远低于年线",
+    "深度破位(极值区)": "远低于年线（极值）",
+    "数据不足": "数据不足",
+}
+ACT_CN = {
+    "持有不动,吃股息": "持有，拿分红",
+    "可小幅止盈(慎用)": "可以小幅止盈",
+    "考虑大笔减仓(留核心仓)": "大笔减仓，留底仓",
+    "可考虑开始定投(小额定期买入)": "可以开始小额定投",
+    "开始分批加仓": "开始分批加仓",
+    "大笔重仓抄底": "大笔买入",
+}
+
+
 def div_lines(tag, cfg, x, weighted):
-    """红利指数：位置 + 估值 双轴"""
+    """红利指数：价格位置 + 估值，两段分开说"""
     L = []
-    title = "**%s %s（%s）· %s**" % (
+    L.append("**%s %s（%s）· %s**" % (
         tag, cfg["name"], cfg["code"],
-        "锚：均线位置 + 估值分位" if weighted else "观察（不加权）")
-    L.append(title)
+        "看价格位置 + 估值贵不贵" if weighted else "只看不动手（不加权）"))
     if not x.get("ok"):
         L.append("→ 取数失败：%s" % x.get("err"))
         L.append("⚠ " + cfg["pit_short"])
         return L
-    L.append("位置 偏离 **%+.2f%%**（%s）｜ 距250日高 %+.1f%% ｜ 源：%s" %
-             (x["pct"], x["zone"], x["dd"], x["src"]))
-    L.append("估值 股息率 **%.2f%%** ｜ PE %.2f（分位%.0f%%）｜ PB %.2f（分位%.0f%%）" %
+    word = "高于" if x["pct"] >= 0 else "低于"
+    L.append("价格：%s年线 **%+.2f%%**（%s）｜ 距一年最高 %+.1f%% ｜ 数据：%s" %
+             (word, x["pct"], ZONE_CN.get(x["zone"], x["zone"]), x["dd"], x["src"]))
+    L.append("估值：股息率 **%.2f%%** ｜ 市盈率 %.2f（分位%.0f%%）｜ 市净率 %.2f（分位%.0f%%）" %
              (x["yld"], x["pe"], x["pe_pct"], x["pb"], x["pb_pct"]))
-    tail = " ｜ 仅观察" if not weighted else ""
-    L.append("→ 位置：%s ｜ 估值：**%s**%s" % (x["action"], x["val"], tail))
+    tail = " ｜ 只观察，不买" if not weighted else ""
+    L.append("→ 价格：%s ｜ 估值：**%s**%s" %
+             (ACT_CN.get(x["action"], x["action"]), x["val"], tail))
     L.append("⚠ " + cfg["pit_short"])
     return L
 
@@ -167,11 +202,11 @@ def build(d, mode):
     # 总开关
     e = d["erp"]
     L.append("")
-    L.append("**◆ 总开关｜ERP 决定总仓位**")
+    L.append("**◆ 总开关｜决定股票总共买多少**")
     if e.get("ok"):
-        L.append("ERP **%s** → 权益 **%d%%**（%s）" %
+        L.append("股债性价比 **%s** → 股票仓位 **%d%%**（%s）" %
                  (f2(e["erp"], "%"), round(e["target"] * 100), e["label"]))
-        L.append("\u3000PE %s（%s）｜10年国债 %s" % (f2(e["pe"]), e["pe_src"], f2(e["bond"], "%")))
+        L.append("\u3000宽基市盈率 %s（%s）｜10年国债 %s" % (f2(e["pe"]), e["pe_src"], f2(e["bond"], "%")))
     else:
         L.append("取数失败：%s" % e.get("err"))
 
@@ -185,16 +220,18 @@ def build(d, mode):
     # ① A500
     a = d["a500"]
     L.append("")
-    L.append("**① 中证A500（512050）· 锚：估值分位**")
+    L.append("**① 中证A500（512050）· 看估值贵不贵**")
     if a.get("ok"):
-        tag = "（%s代理）" % a["src"] if a["proxy"] else ""
-        L.append("PE分位 **%s**%s ｜ PB分位 **%s** ｜ 取低 **%s**（%s）" %
+        tag = "（借用%s）" % a["src"] if a["proxy"] else ""
+        btxt = a["basis"].replace("PB", "市净率").replace("PE", "市盈率")
+        btxt = btxt.replace("降一档", "已降一档").replace("取高", "改取较高")
+        L.append("市盈率分位 **%s**%s ｜ 市净率分位 **%s** ｜ 取更低者 **%s**（%s）" %
                  (f1(a["pct_pe"], "%"), tag, f1(a["pb_pct"], "%"),
-                  f1(a["pct"], "%"), a["basis"]))
+                  f1(a["pct"], "%"), btxt))
         amt = "（%s元）" % format(int(a["amount"]), ",") if a.get("amount") else ""
-        L.append("→ **%s %.1f×**%s" % (a["action"], a["mult"], amt))
+        L.append("→ **%s**（本月按基准金额 %.1f 倍）%s" % (a["action"], a["mult"], amt))
         if a.get("warn"):
-            L.append("\u3000※ " + a["warn"])
+            L.append("\u3000※ 市盈率与市净率分位差 %.0f 个百分点，说明盈利在变差，已自动降一档" % a["div"])
     else:
         L.append("→ 取数失败：%s" % a.get("err"))
     L.append("⚠ " + C.A500["pit_short"])
@@ -210,17 +247,23 @@ def build(d, mode):
     # ④ 标普500
     sp = d["sp"]
     L.append("")
-    L.append("**④ 标普500（513500）· 锚：溢价率**")
+    L.append("**④ 标普500（513500）· 看溢价（只管在哪买，不管买多少）**")
     if sp.get("ok"):
         shv, exp8 = sp.get("shiller"), sp.get("exp8")
-        sht = f1(shv)
+        if shv is None:
+            L.append("溢价 **%s**（按昨日净值算）｜ 席勒市盈率 —（本次没取到）" % sg(sp["prem"]))
+        else:
+            src = sp.get("shiller_src") or ""
+            tail = "" if src.startswith("Guru") else "（来源 %s）" % (src or "备用源")
+            L.append("溢价 **%s**（按昨日净值算）｜ 席勒市盈率 **%s**%s" %
+                     (sg(sp["prem"]), f1(shv), tail))
+        extra = ""
+        if (shv or 0) > 35:
+            extra += " ｜ 已进警戒区（只提示风险，不据此减仓）"
         if exp8 is not None:
-            sht += "（8年预期年化 %s）" % f1(exp8, "%")
-        L.append("溢价 **%s**（T-1净值）｜ 席勒PE **%s**" % (sg(sp["prem"]), sht))
-        L.append("PE %s（分位%s）%s" %
-                 (f1(sp["pe"]), f1(sp["pe_pct"], "%"),
-                  " ｜ 席勒PE>35 属警戒区" if (shv or 0) > 35 else ""))
-        L.append("→ **%s**" % sp["action"])
+            extra += " ｜ 按席勒倒推未来8年年化约 %s" % f1(exp8, "%")
+        L.append("普通市盈率 %s（分位%s）%s" % (f1(sp["pe"]), f1(sp["pe_pct"], "%"), extra))
+        L.append("→ 渠道：**%s**（与买多少、卖不卖无关）" % sp["action"])
         if sp["prem"] >= 1.5:
             L.append("\u3000※ 下单前必须核实实时 IOPV")
     else:
@@ -230,15 +273,12 @@ def build(d, mode):
     # ⑤ 固收桶
     b = d["sb"]
     L.append("")
-    L.append("**⑤ %s（511360 为主）· 锚：资金面，不择时**" % C.ASSET_BY_KEY["short_bond"]["name"])
+    L.append("**⑤ %s（511360 为主）· 看资金面，不择时**" % C.ASSET_BY_KEY["short_bond"]["name"])
     if b.get("ok"):
-        fr = []
-        if b.get("gc007"):
-            fr.append("GC007 %s" % f2(b["gc007"], "%"))
-        if b.get("shibor"):
-            fr.append("Shibor1W %s" % f2(b["shibor"], "%"))
-        L.append("7日年化 **%s** ｜ 资金面 %s ｜ 窗口：%s" %
-                 (f2(b["ann"], "%"), " / ".join(fr) or "—", b.get("window") or "无"))
+        rate = b.get("gc007") or b.get("shibor")
+        fr = "%s" % f2(rate, "%") if rate else "—"
+        L.append("近7日年化 **%s** ｜ 市场短期资金利率 %s ｜ 窗口：%s" %
+                 (f2(b["ann"], "%"), fr, b.get("window") or "无"))
         if b.get("lock"):
             L.append("→ **7日年化≥%.1f%%，可锁定**" % C.SHORT_BOND["lock_yield"])
         elif b.get("window"):
@@ -253,14 +293,14 @@ def build(d, mode):
     # ⑥ 黄金
     g = d["gold"]
     L.append("")
-    L.append("**⑥ 黄金（518880）· 锚：美国实际利率**")
+    L.append("**⑥ 黄金（518880）· 看美国实际利率**")
     if g.get("ok"):
         dx = d.get("dxy") or {}
-        l1 = "TIPS **%s**（20日 %s）" % (f2(g["tips"], "%"), sg(g["tips_chg20"], "pp"))
+        l1 = "美国10年期抗通胀国债收益率 **%s**（20天 %+.2f 个百分点）" % (f2(g["tips"], "%"), g["tips_chg20"])
         if dx.get("ok"):
-            l1 += " ｜ 美元 **%s**（%s）" % (f2(dx["value"]), dx["zone"])
+            l1 += " ｜ 美元指数 **%s**（%s）" % (f2(dx["value"]), dx["zone"])
         L.append(l1)
-        L.append("距250日高 **%s** ｜ 60日 %s ｜ TIPS日期 %s" %
+        L.append("距一年最高 **%s** ｜ 近60天 %s ｜ 数据日 %s" %
                  (sg(g["dd"]), sg(g["chg60"]), g["tips_date"]))
         if g.get("spike"):
             L.append("→ **60日涨超%.0f%%，先减一部分**" % C.GOLD["spike_cut"])
@@ -349,7 +389,8 @@ def build(d, mode):
         L.append("*执行 %s 北京 / %s UTC ｜ 触发：%s*" %
                  (now.strftime("%m-%d %H:%M"), utc,
                   os.environ.get("TRIGGER", "本地/未知")))
-        L.append("*六个标的锚不同：估值分位 / 均线+估值 / 溢价率 / 资金面 / 实际利率*")
+        L.append("*分位＝当前估值在过去十年里的位置，0% 最便宜、100% 最贵*")
+        L.append("*每个标的看的东西不同：估值贵不贵 / 价格位置 / 溢价 / 资金面 / 实际利率*")
 
     return "\n".join(L)
 

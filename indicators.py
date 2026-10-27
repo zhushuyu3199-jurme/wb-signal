@@ -12,7 +12,7 @@
   实际利率    FRED fred.stlouisfed.org (DFII10)
   资金面      上交所 GC007（DR007 代理）
 """
-import csv, io, json, os, urllib.request
+import csv, io, json, os, time, urllib.request
 from datetime import datetime, timedelta, timezone
 
 import config as C
@@ -79,10 +79,21 @@ def fetch_quotes(codes):
     return out
 
 
+def _get_retry(url, referer=None, timeout=20, encoding="utf-8", tries=3):
+    last = None
+    for i in range(tries):
+        try:
+            return _get(url, referer=referer, timeout=timeout, encoding=encoding)
+        except Exception as ex:
+            last = ex
+            time.sleep(1.2)
+    raise last
+
+
 def fetch_kline(code, n=300):
     url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
            % (code, n))
-    d = json.loads(_get(url))
+    d = json.loads(_get_retry(url))
     node = d.get("data", {}).get(code, {})
     rows = node.get("qfqday") or node.get("day") or []
     out = []
@@ -128,8 +139,9 @@ def fetch_bond_10y():
     return {"value": v, "date": str(row.get("SOLAR_DATE", ""))[:10]}
 
 
-def fetch_tips10():
-    txt = _get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10")
+def fred_last(sid, timeout=30, tries=2):
+    txt = _get_retry("https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s" % sid,
+                     timeout=timeout, tries=tries)
     rows = []
     for r in csv.reader(io.StringIO(txt)):
         if len(r) < 2 or r[0] == "observation_date" or not r[1].strip():
@@ -139,7 +151,30 @@ def fetch_tips10():
         except ValueError:
             continue
     if not rows:
-        raise ValueError("DFII10 无数据")
+        raise ValueError("%s 无数据" % sid)
+    return rows
+
+
+def fetch_us10y():
+    """美元10年期名义利率 —— 港股通红利的无风险基准（港币挂美元）"""
+    if C.USD_10Y_OVERRIDE:
+        return {"value": float(C.USD_10Y_OVERRIDE), "src": "手动", "date": ""}
+    try:
+        r = fred_last("DGS10")
+        return {"value": r[-1][1], "src": "FRED DGS10", "date": r[-1][0]}
+    except Exception:
+        pass
+    try:
+        r = fred_last("DFII10")
+        return {"value": r[-1][1] + C.USD_BREAKEVEN_ASSUMED,
+                "src": "TIPS+%.1fpp估算" % C.USD_BREAKEVEN_ASSUMED, "date": r[-1][0]}
+    except Exception:
+        pass
+    return {"value": C.USD_10Y_FALLBACK, "src": "兜底常量", "date": ""}
+
+
+def fetch_tips10():
+    rows = fred_last("DFII10")
     back = rows[-21] if len(rows) >= 21 else rows[0]
     return {"value": rows[-1][1], "date": rows[-1][0],
             "chg20": rows[-1][1] - back[1]}
@@ -187,13 +222,13 @@ def calc_dxy():
     if not (60 < v < 160):
         raise ValueError("美元指数 %.1f 异常" % v)
     if v >= 102:
-        zone = "强势（压制金价）"
+        zone = "强势·压制金价"
     elif v >= 98:
         zone = "中性偏强"
     elif v >= 95:
         zone = "中性偏弱"
     else:
-        zone = "弱势（利好金价）"
+        zone = "弱势·利好金价"
     return {"value": v, "zone": zone}
 
 
@@ -248,6 +283,72 @@ def band_upper(v, bands, idx=1):
     return sorted(bands, key=lambda r: r[0])[-1][idx]
 
 
+def fetch_kline_sina(symbol, n=2000):
+    url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           "CN_MarketData.getKLineData?symbol=%s&scale=240&ma=no&datalen=%d" % (symbol, n))
+    t = _get_retry(url, referer="https://finance.sina.com.cn/")
+    d = json.loads(t)
+    if not isinstance(d, list) or len(d) < 60:
+        raise ValueError("新浪日线不足")
+    out = sorted([{"d": x["day"], "c": float(x["close"]),
+                   "h": float(x["high"]), "l": float(x["low"])} for x in d],
+                 key=lambda r: r["d"])
+    # 新鲜度校验：最后一条必须是近期的，否则该源返回的是最老的一段
+    last = out[-1]["d"]
+    today = now_bj().strftime("%Y-%m-%d")
+    try:
+        gap = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(last, "%Y-%m-%d")).days
+    except Exception:
+        gap = 999
+    if gap > 15:
+        raise ValueError("新浪数据过旧(末条 %s)，改用其他源" % last)
+    return out
+
+
+def fetch_kline_any(symbols, n=1200):
+    """新浪优先（历史更长），腾讯兜底"""
+    for s in symbols:
+        try:
+            return fetch_kline_sina(s, n), "新浪"
+        except Exception:
+            pass
+    for s in symbols:
+        try:
+            rows = fetch_kline(s, min(n, 800))
+            if len(rows) >= 60:
+                return rows, "腾讯"
+        except Exception:
+            pass
+    raise ValueError("日线取不到: %s" % ",".join(symbols))
+
+
+def calc_div_index(cfg, bond_cn=None):
+    """红利指数：位置（均线偏离，沿用 ma250_monitor）+ 估值（PE/PB分位）"""
+    r = {"ok": False, "err": None}
+    try:
+        rows, src = fetch_kline_any(cfg["px"])
+        closes = [x["c"] for x in rows]
+        dates = [x["d"] for x in rows]
+        from ma250_monitor import signal_for
+        sig = signal_for(closes, dates, label=cfg["code"])
+        eva = fetch_index_eva(cfg["eva"])
+        if not eva:
+            raise ValueError("估值取不到")
+        pe_pct = eva["pe_pct"]
+        val = band_upper(pe_pct, C.DIV_VAL_BANDS, 1)
+        peak = max(closes[-250:])
+        r.update(ok=True, close=closes[-1], ma=sig["ma"], pct=sig["pct"],
+                 zone=sig["zone"], action=sig["action"], level=sig["level"],
+                 dd=(closes[-1] / peak - 1) * 100, src=src, n=len(rows),
+                 start=dates[0],
+                 yld=eva["yield"], pe=eva["pe"], pb=eva["pb"],
+                 pe_pct=pe_pct, pb_pct=eva["pb_pct"], val=val,
+                 spread_cn=(eva["yield"] - bond_cn) if bond_cn else None)
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
 # ══ 指标
 def calc_erp():
     r = {"ok": False, "err": None}
@@ -286,13 +387,29 @@ def calc_a500():
         if not eva:
             raise ValueError("A500估值取不到")
         pct_pe, pct_pb = eva["pe_pct"], eva["pb_pct"]
-        if C.A500.get("judge") == "min":
-            pct, basis = min(pct_pe, pct_pb), ("PE" if pct_pe <= pct_pb else "PB")
-        else:
+        div = abs(pct_pe - pct_pb)
+        judge = C.A500.get("judge", "auto")
+        low_src = "PE" if pct_pe <= pct_pb else "PB"
+        high_src = "PB" if low_src == "PE" else "PE"
+        warn = None
+        if judge == "pe":
             pct, basis = pct_pe, "PE"
+        elif judge == "min":
+            pct, basis = min(pct_pe, pct_pb), low_src
+        else:  # auto
+            if div >= C.A500["div_warn"]:
+                pct, basis = max(pct_pe, pct_pb), high_src + "取高"
+                warn = "PE/PB背离 %.0fpp，盈利质量预警，已改取高" % div
+            elif div >= C.A500["div_soft"]:
+                pct = min(100.0, min(pct_pe, pct_pb) + C.A500["div_penalty"])
+                basis = low_src + "降一档"
+                warn = "PE/PB背离 %.0fpp，已降一档" % div
+            else:
+                pct, basis = min(pct_pe, pct_pb), low_src
         mult, act = band_upper(pct, C.A500["pe_bands"], 1), band_upper(pct, C.A500["pe_bands"], 2)
         r.update(ok=True, pct=pct, pct_pe=pct_pe, pe=eva["pe"], pb=eva["pb"],
                  pb_pct=pct_pb, src=src, proxy=proxy, basis=basis,
+                 div=div, warn=warn,
                  mult=mult, action=act,
                  amount=(C.DCA_BASE_AMOUNT * mult) if C.DCA_BASE_AMOUNT else None,
                  date=eva.get("date"))
@@ -301,7 +418,7 @@ def calc_a500():
     return r
 
 
-def calc_hk_div(bond_value=None):
+def calc_hk_div(bond_cn=None, bond_us=None):
     r = {"ok": False, "err": None}
     m = load_manual().get("hk_yield", {})
     v = m.get("value") or C.HK_YIELD_MANUAL.get("value")
@@ -316,10 +433,12 @@ def calc_hk_div(bond_value=None):
         except ValueError:
             pass
     v = float(v)
-    zone = band_lower(v, C.HK_DIV["yield_bands"], 1)
-    spread = (v - bond_value) if bond_value else None
+    frozen = (age is not None and age > C.HK_YIELD_FREEZE_DAYS)
+    zone = "数据过期，冻结判定" if frozen else band_lower(v, C.HK_DIV["yield_bands"], 1)
     r.update(ok=True, value=v, asof=asof, age=age, zone=zone,
-             spread=spread, net=v * 0.8,
+             spread_us=(v - bond_us) if bond_us else None,
+             spread_cn=(v - bond_cn) if bond_cn else None,
+             frozen=frozen, net=v * 0.8,
              stale=(age is not None and age > C.HK_YIELD_STALE_DAYS))
     return r
 
@@ -404,10 +523,13 @@ def calc_gold():
         dd = (price / peak - 1) * 100
         chg60 = (price / rows[-61]["c"] - 1) * 100
         label = band_lower(tips["value"], C.GOLD["tips_bands"], 1)
+        conflict = (tips["value"] >= 2.0 and dd <= -25.0)
+        if conflict:
+            label = "信号冲突：利率压制 vs 深度回撤（需人工判断）"
         trigger = (tips["chg20"] <= -0.20) and (dd <= -15.0)
         r.update(ok=True, tips=tips["value"], tips_date=tips["date"],
                  tips_chg20=tips["chg20"], label=label, price=price,
-                 dd=dd, chg60=chg60, trigger=trigger,
+                 dd=dd, chg60=chg60, trigger=trigger, conflict=conflict,
                  spike=(chg60 >= C.GOLD["spike_cut"]))
     except Exception as e:
         r["err"] = "%s: %s" % (type(e).__name__, e)

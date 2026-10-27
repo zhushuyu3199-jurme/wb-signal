@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-ETF 组合监测 · 配置文件（v2 · 按「各自锚」重设计）
+定盘 · 配置文件（每个标的一把锚）
 ================================
-五个标的赚钱的底层逻辑不同，锚也不同：
+组合（2026-10-27 调整后）：
   A500      锚：估值分位
-  港股通红利 锚：股息率 vs 无风险利率
+  红利低波   锚：均线位置 + 估值分位（H30269，10% 权重）
+  中证红利   锚：均线位置 + 估值分位（000922，仅观察不加权）
   标普500    锚：溢价率
-  短融       锚：资金面（不择时）
+  固收桶     锚：资金面（不择时）
   黄金       锚：美国实际利率
-
-指标只回答「该买多少」，不回答「什么时候涨」。
 """
 
 # ══ 总开关：ERP = 1/PE − 10年期国债收益率
@@ -23,16 +22,25 @@ ERP_PE_INDEX = "SH000510"
 ERP_PE_PROXY = "SH000300"
 BOND_YIELD_FIELD = "EMM00166469"
 BOND_YIELD_OVERRIDE = None
-EQUITY_BASE = 0.55
+
+# 美元 10 年期名义利率 —— 港币挂美元，港股类资产的无风险基准
+USD_10Y_OVERRIDE = None
+USD_BREAKEVEN_ASSUMED = 2.30
+USD_10Y_FALLBACK = 4.10
+
+EQUITY_BASE = 0.55          # A500 + 红利低波 + 标普500
+EQUITY_KEYS = ("a500", "div_low", "sp500")
 
 # ── ① 中证A500 ｜ 锚：估值分位
 A500 = {
     "key": "a500", "name": "中证A500",
     "etf": "sh512050", "etf_name": "A500ETF华夏",
-    "anchor": "估值分位", "weight": 0.30,
+    "anchor": "估值分位", "weight": 0.30, "weighted": True,
     "indices": ["SH000510", "SH000300"],
-    # 判据：min = 取 PE 分位与 PB 分位中较低者（更保守）；pe = 只看 PE
-    "judge": "min",
+    "judge": "auto",
+    "div_warn": 25.0,
+    "div_soft": 15.0,
+    "div_penalty": 10.0,
     "pe_bands": [
         (20.0, 3.0, "全力加"),
         (30.0, 2.0, "定投加倍"),
@@ -42,78 +50,63 @@ A500 = {
     ],
     "paint": "PE-TTM十年分位（主）· PB十年分位（辅）· 股债性价比ERP",
     "pit_short": "分位低能更低→分批 · 期短用300代理 · 熊末PE失真看PB · 高估可持续一年",
-    "pitfalls": [
-        "分位低可能更低（2018年到20%后又跌30%）→ 只能分批",
-        "新指数历史短 → 用沪深300代理",
-        "熊市末期PE虚高（盈利下滑）→ 改看PB",
-        "高估可持续一年以上 → 别太早清仓",
-    ],
 }
 
-# ── ② 港股通红利 ｜ 锚：股息率 vs 无风险利率
-HK_DIV = {
-    "key": "hk_div", "name": "港股通红利",
-    "etf": "sz159569", "etf_name": "港股红利低波ETF（景顺）",
-    "anchor": "股息率−无风险利率", "weight": 0.10,
-    "yield_bands": [
-        (6.5, "重仓加"),
-        (5.0, "持有"),
-        (4.5, "减半"),
-        (4.0, "减到三成"),
-        (-99.0, "清仓"),
-    ],
-    "paint": "股息率（核心）· 股息利差 · 南向资金（情绪）",
-    "pit_short": "高息可能是假的 · 红利税20% · 汇率吃收益 · 热的时候别买",
-    "pitfalls": [
-        "股息率是过去12个月，盈利下滑时可能是假高息",
-        "港股通红利税20%，5.6%实际到手≈4.5%",
-        "汇率暗吃收益（港币挂美元）",
-        "人人讨论红利时，往往是阶段高点",
-    ],
+# ── ② 红利低波 ｜ 锚：均线位置 + 估值分位（10% 权重）
+DIV_LOW = {
+    "key": "div_low", "name": "红利低波", "code": "H30269",
+    "etf": "sh512890", "etf_name": "红利低波ETF（华泰柏瑞）",
+    "anchor": "均线位置 + 估值分位", "weight": 0.10, "weighted": True,
+    "eva": "CSIH30269",
+    # 价格序列：512890 跟踪 H30269，且从未分红 → 无除息跳空，可作干净代理
+    "px": ["sh512890"],
+    "px_note": "ETF代理（512890 无分红）",
+    "pit_short": "与中证红利高度重叠 · PE分位已80% · ETF有跟踪误差",
 }
 
-# ── ③ 标普500 ｜ 锚：溢价率
+# ── ③ 中证红利 ｜ 仅观察，不加权
+DIV_922 = {
+    "key": "div_922", "name": "中证红利", "code": "000922",
+    "anchor": "均线位置 + 估值分位", "weight": 0.0, "weighted": False,
+    "eva": "SH000922",
+    "px": ["sh000922"],
+    "px_note": "指数原始序列",
+    "pit_short": "与红利低波重叠 · 高息可能来自股价跌 · 分红看现金流",
+}
+
+# ── ④ 标普500 ｜ 锚：溢价率
 SP500 = {
     "key": "sp500", "name": "标普500",
     "etf": "sh513500", "etf_name": "标普500ETF博时",
-    "anchor": "溢价率", "weight": 0.15, "otc_fund": "050025",
+    "anchor": "溢价率", "weight": 0.15, "weighted": True, "otc_fund": "050025",
     "prem_bands": [
-        (8.0, "可卖出套利"),
+        (8.0, "溢价极高，暂缓一切操作（个人无套利通道）"),
         (3.0, "暂停买入"),
         (1.5, "改场外申购 050025"),
         (-99.0, "场内可买"),
     ],
     "paint": "IOPV溢价率（每天）· 席勒PE · 美元人民币",
     "pit_short": "溢价天天变必看IOPV · 场外常限购 · 别用分位判死 · 汇率双刃",
-    "pitfalls": [
-        "溢价每天变，下单前必看实时IOPV",
-        "场外常限购，大额买不进",
-        "估值中枢在抬升，别用历史分位判死",
-        "汇率双刃剑，人民币升值侵蚀收益",
-    ],
 }
 
-# ── ④ 短融 ｜ 锚：资金面，不择时
+# ── ⑤ 固收桶 ｜ 锚：资金面，不择时（40%）
 SHORT_BOND = {
-    "key": "short_bond", "name": "短融",
+    "key": "short_bond", "name": "固收桶",
     "etf": "sh511360", "etf_name": "短融ETF海富通",
     "fund_code": "511360",
-    "anchor": "资金面（不择时）", "weight": 0.40,
+    "anchor": "资金面（不择时）", "weight": 0.40, "weighted": True,
     "lock_yield": 2.5,
+    "components": "短融ETF + 南方金利定开 + 易方达增强回报",
+    "has_lock": True,
     "paint": "7日年化 · DR007（用GC007代理）· 月末季末年末",
-    "pit_short": "别为0.5%折腾 · 有信用风险 · 是弹药库不是收益源",
-    "pitfalls": [
-        "别为0.5%频繁交易，佣金吃掉收益",
-        "有信用风险（2020永煤AAA也违约）",
-        "它是权益的弹药库，不是收益来源",
-    ],
+    "pit_short": "含定开有流动性锁 · 一级债基含转债敞口 · 弹药可能取不出",
 }
 
-# ── ⑤ 黄金 ｜ 锚：美国实际利率
+# ── ⑥ 黄金 ｜ 锚：美国实际利率（5%）
 GOLD = {
     "key": "gold", "name": "黄金",
     "etf": "sh518880", "etf_name": "黄金ETF华安",
-    "anchor": "美国实际利率", "weight": 0.05,
+    "anchor": "美国实际利率", "weight": 0.05, "weighted": True,
     "tips_bands": [
         (-99.0, "TIPS<0%：大牛市环境"),
         (0.0, "TIPS 0–1%：温和利好"),
@@ -123,42 +116,41 @@ GOLD = {
     "spike_cut": 30.0,
     "paint": "美国10Y TIPS（核心）· 美元指数",
     "pit_short": "抗实际利率非通胀 · 无估值锚 · 5%是保险 · 涨30%要减",
-    "pitfalls": [
-        "黄金抗的是实际利率，不是通胀（2022通胀9%金价反跌）",
-        "没有估值锚，只能看相对利率吸引力",
-        "5%是保险不是投资，用于股债双杀时对冲",
-        "短期涨超30%要减，情绪上涨会回吐",
-    ],
 }
 
-ASSETS = [A500, HK_DIV, SP500, SHORT_BOND, GOLD]
+ASSETS = [A500, DIV_LOW, DIV_922, SP500, SHORT_BOND, GOLD]
 ASSET_BY_KEY = {a["key"]: a for a in ASSETS}
 
 # ── 手动数据
 HK_YIELD_MANUAL = {"value": None, "asof": None}
 HK_YIELD_STALE_DAYS = 45
+HK_YIELD_FREEZE_DAYS = 90
 SHILLER_PE_MANUAL = {"value": None, "asof": None}
 SHILLER_URL = "https://www.gurufocus.cn/indicator/shiller_pe"
 TOTAL_CAPITAL = None
 DCA_BASE_AMOUNT = None
 
+# ── 红利指数：位置档来自 ma250_monitor，估值档按 PE 分位
+DIV_VAL_BANDS = [
+    (30.0, "便宜"),
+    (70.0, "中性"),
+    (85.0, "偏贵"),
+    (101.0, "贵"),
+]
+
+# ── 旧持仓（已缩减为仅南方金利）
+LEGACY = [
+    {"key": "fund", "name": "南方金利定开", "code": "sz160128",
+     "pit_short": "定开有流动性锁 · 折价可能长期不收敛 · 债基有信用风险"},
+]
+
 # ── 再平衡
 REBALANCE_BAND = 0.05
 REBALANCE_MONTH = 12
 REBALANCE_LAST_WEEK = True
-HOLDINGS = {"a500": None, "hk_div": None, "sp500": None, "short_bond": None, "gold": None}
+HOLDINGS = {"a500": None, "div_low": None, "sp500": None, "short_bond": None, "gold": None}
 
-# ══ 旧持仓标的（原四标的日报，已并入本推送）
-LEGACY = [
-    {"key": "idx955", "name": "红利低波100", "code": "cs930955",
-     "pit_short": "银行权重高易被绑架 · 均值回归非趋势 · 破位可长期不修复"},
-    {"key": "idx922", "name": "中证红利", "code": "sh000922",
-     "pit_short": "高息可能来自股价跌 · 分红可持续性看现金流 · 同质化高"},
-    {"key": "fund", "name": "南方金利定开", "code": "sz160128",
-     "pit_short": "定开有流动性锁 · 折价可能长期不收敛 · 债基有信用风险"},
-    {"key": "etf513300", "name": "纳指ETF华夏", "code": "sh513300",
-     "pit_short": "QDII溢价常高 · 汇率与时差双扰动 · 泡沫顶难判"},
-]
-
-PUSH_TITLE_PREFIX = "组合监测"
+PUSH_TITLE_PREFIX = "定盘"
 PUSH_HOURS = [12.0, 22.0]
+SEND_WINDOW_NOON = (11.0, 14.5)
+SEND_WINDOW_NIGHT = (21.0, 23.99)

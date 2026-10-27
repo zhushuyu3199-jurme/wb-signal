@@ -11,6 +11,7 @@
   python run_daily.py --set-shiller 36.2  # 录入标普500 席勒PE
 """
 import argparse, json, os, sys
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,27 +36,34 @@ def target_weights(erp_target):
     if erp_target is None:
         erp_target = C.EQUITY_BASE
     scale = erp_target / C.EQUITY_BASE
-    w = {k: C.ASSET_BY_KEY[k]["weight"] * scale for k in ("a500", "hk_div", "sp500")}
+    w = {k: C.ASSET_BY_KEY[k]["weight"] * scale for k in C.EQUITY_KEYS}
     w["gold"] = C.ASSET_BY_KEY["gold"]["weight"]
     w["short_bond"] = 1.0 - sum(w.values())
     if w["short_bond"] < 0.05:
         excess = 0.05 - w["short_bond"]
-        eq = sum(w[k] for k in ("a500", "hk_div", "sp500"))
-        for k in ("a500", "hk_div", "sp500"):
+        eq = sum(w[k] for k in C.EQUITY_KEYS)
+        for k in C.EQUITY_KEYS:
             w[k] -= excess * w[k] / eq
         w["short_bond"] = 0.05
     return w
 
 
 def gather():
-    codes = [a["etf"] for a in C.ASSETS]
+    codes = [a["etf"] for a in C.ASSETS if a.get("etf")]
     try:
         quotes = I.fetch_quotes(codes)
     except Exception as e:
         quotes = {}
         print("[warn] 行情失败: %s" % e)
-    get = lambda k: quotes.get(C.ASSET_BY_KEY[k]["etf"].lstrip("shsz"))
+    def get(k):
+        code = C.ASSET_BY_KEY[k].get("etf")
+        return quotes.get(code.lstrip("shsz")) if code else None
     erp = I.calc_erp()
+    us10y = None
+    try:
+        us10y = I.fetch_us10y()
+    except Exception:
+        us10y = {"value": None, "src": "取数失败"}
 
     def safe(fn, *a):
         try:
@@ -68,7 +76,9 @@ def gather():
     return {
         "erp": erp,
         "a500": I.calc_a500(),
-        "hk": I.calc_hk_div(erp.get("bond") if erp.get("ok") else None),
+        "div_low": I.calc_div_index(C.DIV_LOW, erp.get("bond") if erp.get("ok") else None),
+        "div_922": I.calc_div_index(C.DIV_922, erp.get("bond") if erp.get("ok") else None),
+        "us10y": us10y,
         "sp": I.calc_sp500(get("sp500")) if get("sp500") else {"ok": False, "err": "无行情"},
         "sb": I.calc_short_bond(),
         "gold": I.calc_gold(),
@@ -78,39 +88,31 @@ def gather():
     }
 
 
+STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_state.json")
+DEDUPE_MINUTES = 40
+
+
+def _read_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_state(slot, when_iso):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"slot": slot, "at": when_iso}, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def legacy_blocks():
-    """原四标的：复用 combo_daily 的信号引擎，输出精简块"""
+    """旧持仓：仅南方金利定开"""
     import combo_daily as L
     out = []
-    p1, p2, p3, p4 = [x["pit_short"] for x in C.LEGACY]
-
-    # 红利低波100
-    try:
-        h = json.load(open(L.HIST_IDX, encoding="utf-8"))
-        snap = L.fetch_index_snapshot("cs930955")
-        L.merge_hist(h, snap["date"], snap["close"])
-        json.dump(h, open(L.HIST_IDX, "w", encoding="utf-8"), ensure_ascii=False)
-        idx = L.signal_for(h["closes"], h["dates"], label="cs930955")
-        out += ["", "**⑥ 红利低波100（cs930955）· 250日均线档位**",
-                "偏离 **%+.2f%%**（%s）→ %s" % (idx["pct"], idx["zone"], idx["action"]),
-                "⚠ " + p1]
-    except Exception as e:
-        out += ["", "**⑥ 红利低波100**：取数失败（%s）" % e]
-
-    # 中证红利
-    try:
-        h = json.load(open(L.HIST_922, encoding="utf-8"))
-        snap = L.fetch_index_snapshot("sh000922")
-        L.merge_hist(h, snap["date"], snap["close"])
-        json.dump(h, open(L.HIST_922, "w", encoding="utf-8"), ensure_ascii=False)
-        idx = L.signal_for(h["closes"], h["dates"], label="sh000922")
-        out += ["", "**⑦ 中证红利（sh000922）· 250日均线档位**",
-                "偏离 **%+.2f%%**（%s）→ %s" % (idx["pct"], idx["zone"], idx["action"]),
-                "⚠ " + p2]
-    except Exception as e:
-        out += ["", "**⑦ 中证红利**：取数失败（%s）" % e]
-
-    # 南方金利
+    p1 = C.LEGACY[0]["pit_short"]
     try:
         rows = L.fetch_kline_rows("sz160128", 150)
         try:
@@ -124,32 +126,41 @@ def legacy_blocks():
             f = L.fund_signal(rows, dict(date="缺", nav=rows[-1]["close"]))
             f.update(nav=None, nav_date=None, discount=None, disc_gap=None)
             disc = "净值暂缺"
-        out += ["", "**⑧ 南方金利定开（160128）· 折价率**",
+        out += ["", "**⑦ 南方金利定开（160128）· 折价率**",
                 "%s ｜ 20日偏离 %+.2f%% ｜ 新低20/40：%s/%s" %
                 (disc, f["dev20"], "是" if f["new20"] else "否", "是" if f["new40"] else "否"),
-                "→ %s" % f["action"], "⚠ " + p3]
+                "→ %s" % f["action"], "⚠ " + p1]
     except Exception as e:
-        out += ["", "**⑧ 南方金利定开**：取数失败（%s）" % e]
-
-    # 纳指ETF
-    try:
-        prows = L.fetch_kline_rows("sh513300", 500)
-        nds, ncs, _ = L.update_nav_lib(L.NAV_513300, "513300")
-        e = L.etf513300_signal(prows, nds, ncs)
-        out += ["", "**⑨ 纳指ETF华夏（513300）· 泡沫止盈+回撤加仓**",
-                "价格 **%.3f** ｜ 溢价 **%+.2f%%** ｜ 净值回撤 %+.2f%%" %
-                (e["price"], e["premium"], e["nav_dd"]),
-                "→ %s ｜ 溢价：%s" % (e["action"], e["prem_act"]), "⚠ " + p4]
-    except Exception as e:
-        out += ["", "**⑨ 纳指ETF华夏**：取数失败（%s）" % e]
+        out += ["", "**⑦ 南方金利定开**：取数失败（%s）" % e]
     return out
+
+
+def div_lines(tag, cfg, x, weighted):
+    """红利指数：位置 + 估值 双轴"""
+    L = []
+    title = "**%s %s（%s）· %s**" % (
+        tag, cfg["name"], cfg["code"],
+        "锚：均线位置 + 估值分位" if weighted else "观察（不加权）")
+    L.append(title)
+    if not x.get("ok"):
+        L.append("→ 取数失败：%s" % x.get("err"))
+        L.append("⚠ " + cfg["pit_short"])
+        return L
+    L.append("位置 偏离 **%+.2f%%**（%s）｜ 距250日高 %+.1f%% ｜ 源：%s" %
+             (x["pct"], x["zone"], x["dd"], x["src"]))
+    L.append("估值 股息率 **%.2f%%** ｜ PE %.2f（分位%.0f%%）｜ PB %.2f（分位%.0f%%）" %
+             (x["yld"], x["pe"], x["pe_pct"], x["pb"], x["pb_pct"]))
+    tail = " ｜ 仅观察" if not weighted else ""
+    L.append("→ 位置：%s ｜ 估值：**%s**%s" % (x["action"], x["val"], tail))
+    L.append("⚠ " + cfg["pit_short"])
+    return L
 
 
 def build(d, mode):
     now = I.now_bj()
     night = (mode == "night")
     L = []
-    L.append("**%s · %s**　%s" % (C.PUSH_TITLE_PREFIX,
+    L.append("**%s · %s**\u3000%s" % (C.PUSH_TITLE_PREFIX,
                                   "夜间完整版" if night else "午间快照",
                                   now.strftime("%m-%d %H:%M")))
 
@@ -160,15 +171,16 @@ def build(d, mode):
     if e.get("ok"):
         L.append("ERP **%s** → 权益 **%d%%**（%s）" %
                  (f2(e["erp"], "%"), round(e["target"] * 100), e["label"]))
-        L.append("　PE %s（%s）｜10年国债 %s" % (f2(e["pe"]), e["pe_src"], f2(e["bond"], "%")))
+        L.append("\u3000PE %s（%s）｜10年国债 %s" % (f2(e["pe"]), e["pe_src"], f2(e["bond"], "%")))
     else:
         L.append("取数失败：%s" % e.get("err"))
 
     w = target_weights(e.get("target") if e.get("ok") else None)
     L.append("")
     L.append("**◆ 本期目标权重**")
-    L.append("　" + " ｜ ".join("%s %d%%" % (C.ASSET_BY_KEY[k]["name"], round(w[k] * 100))
-                              for k in ("a500", "hk_div", "sp500", "short_bond", "gold")))
+    L.append("\u3000" + " ｜ ".join(
+        "%s %d%%" % (C.ASSET_BY_KEY[k]["name"], round(w[k] * 100))
+        for k in ("a500", "div_low", "sp500", "short_bond", "gold")))
 
     # ① A500
     a = d["a500"]
@@ -181,77 +193,67 @@ def build(d, mode):
                   f1(a["pct"], "%"), a["basis"]))
         amt = "（%s元）" % format(int(a["amount"]), ",") if a.get("amount") else ""
         L.append("→ **%s %.1f×**%s" % (a["action"], a["mult"], amt))
+        if a.get("warn"):
+            L.append("\u3000※ " + a["warn"])
     else:
         L.append("→ 取数失败：%s" % a.get("err"))
     L.append("⚠ " + C.A500["pit_short"])
 
-    # ② 港股通红利
-    h = d["hk"]
+    # ② 红利低波（10%）
     L.append("")
-    L.append("**② 港股通红利（159569）· 锚：股息率−无风险利率**")
-    if h.get("ok"):
-        stale = "（⚠️已%d天未更新）" % h["age"] if h.get("stale") else ""
-        line = ("股息率 **%s**%s ｜ 到手≈%s ｜ 利差 %s" %
-                (f2(h["value"], "%"), stale, f2(h["net"], "%"),
-                 f1(h["spread"], "pp") if h["spread"] is not None else "—"))
-        sb = d.get("sbx") or {}
-        if sb.get("ok"):
-            tail = "连续买入%d日" % sb["streak_buy"] if sb["streak_buy"] else "连续卖出"
-            line += " ｜ 南向5日 **%+.0f亿**（%s）" % (sb["sum"], tail)
-        L.append(line)
-        L.append("→ **%s**" % h["zone"])
-    else:
-        L.append("股息率 —（未录入）")
-        L.append("→ **待录入**：--set-hk-yield 你的数值")
-    L.append("⚠ " + C.HK_DIV["pit_short"])
+    L.extend(div_lines("②", C.DIV_LOW, d["div_low"], True))
 
-    # ③ 标普500
-    s = d["sp"]
+    # ③ 中证红利（观察）
     L.append("")
-    L.append("**③ 标普500（513500）· 锚：溢价率**")
-    if s.get("ok"):
-        shv, exp8 = s.get("shiller"), s.get("exp8")
+    L.extend(div_lines("③", C.DIV_922, d["div_922"], False))
+
+    # ④ 标普500
+    sp = d["sp"]
+    L.append("")
+    L.append("**④ 标普500（513500）· 锚：溢价率**")
+    if sp.get("ok"):
+        shv, exp8 = sp.get("shiller"), sp.get("exp8")
         sht = f1(shv)
         if exp8 is not None:
             sht += "（8年预期年化 %s）" % f1(exp8, "%")
-        L.append("溢价 **%s**（T-1净值）｜ 席勒PE **%s**" % (sg(s["prem"]), sht))
+        L.append("溢价 **%s**（T-1净值）｜ 席勒PE **%s**" % (sg(sp["prem"]), sht))
         L.append("PE %s（分位%s）%s" %
-                 (f1(s["pe"]), f1(s["pe_pct"], "%"),
+                 (f1(sp["pe"]), f1(sp["pe_pct"], "%"),
                   " ｜ 席勒PE>35 属警戒区" if (shv or 0) > 35 else ""))
-        L.append("→ **%s**" % s["action"])
-        if s["prem"] >= 1.5:
-            L.append("　※ 下单前必须核实实时 IOPV")
+        L.append("→ **%s**" % sp["action"])
+        if sp["prem"] >= 1.5:
+            L.append("\u3000※ 下单前必须核实实时 IOPV")
     else:
-        L.append("→ 取数失败：%s" % s.get("err"))
+        L.append("→ 取数失败：%s" % sp.get("err"))
     L.append("⚠ " + C.SP500["pit_short"])
 
-    # ④ 短融
+    # ⑤ 固收桶
     b = d["sb"]
     L.append("")
-    L.append("**④ 短融（511360）· 锚：资金面，不择时**")
+    L.append("**⑤ %s（511360 为主）· 锚：资金面，不择时**" % C.ASSET_BY_KEY["short_bond"]["name"])
     if b.get("ok"):
-        fund_rate = []
+        fr = []
         if b.get("gc007"):
-            fund_rate.append("GC007 %s" % f2(b["gc007"], "%"))
+            fr.append("GC007 %s" % f2(b["gc007"], "%"))
         if b.get("shibor"):
-            fund_rate.append("Shibor1W %s" % f2(b["shibor"], "%"))
+            fr.append("Shibor1W %s" % f2(b["shibor"], "%"))
         L.append("7日年化 **%s** ｜ 资金面 %s ｜ 窗口：%s" %
-                 (f2(b["ann"], "%"),
-                  " / ".join(fund_rate) or "—", b.get("window") or "无"))
+                 (f2(b["ann"], "%"), " / ".join(fr) or "—", b.get("window") or "无"))
         if b.get("lock"):
             L.append("→ **7日年化≥%.1f%%，可锁定**" % C.SHORT_BOND["lock_yield"])
         elif b.get("window"):
             L.append("→ **%s资金面，闲钱可多买一点**" % b["window"])
         else:
             L.append("→ **正常持有，不动**")
+        L.append("\u3000构成：%s" % C.ASSET_BY_KEY["short_bond"].get("components", ""))
     else:
         L.append("→ 取数失败：%s" % b.get("err"))
     L.append("⚠ " + C.SHORT_BOND["pit_short"])
 
-    # ⑤ 黄金
+    # ⑥ 黄金
     g = d["gold"]
     L.append("")
-    L.append("**⑤ 黄金（518880）· 锚：美国实际利率**")
+    L.append("**⑥ 黄金（518880）· 锚：美国实际利率**")
     if g.get("ok"):
         dx = d.get("dxy") or {}
         l1 = "TIPS **%s**（20日 %s）" % (f2(g["tips"], "%"), sg(g["tips_chg20"], "pp"))
@@ -270,14 +272,14 @@ def build(d, mode):
         L.append("→ 取数失败：%s" % g.get("err"))
     L.append("⚠ " + C.GOLD["pit_short"])
 
-    # 原持仓标的
+    # ⑦ 旧持仓
     try:
         lg = legacy_blocks()
     except Exception:
         lg = []
     if lg:
         L.append("")
-        L.append("**◆ 原持仓标的（延续监控）**")
+        L.append("**◆ 旧持仓**")
         L.extend(lg)
 
     # 今日动作
@@ -286,20 +288,20 @@ def build(d, mode):
         if a["mult"] >= 2:
             acts.append("A500 %s，本月 %.1f×" % (a["action"], a["mult"]))
         elif a["mult"] == 0:
-            acts.append("A500 停投，钱转短融/减仓")
+            acts.append("A500 停投，钱转固收桶/减仓")
         elif a["mult"] < 1:
             acts.append("A500 定投减半")
-    if h.get("ok") and h["zone"] in ("重仓加", "减半", "减到三成", "清仓"):
-        acts.append("港股通红利：%s" % h["zone"])
-    if s.get("ok") and s["prem"] >= 1.5:
-        acts.append("标普500：%s" % s["action"])
+    dl = d["div_low"]
+    if dl.get("ok") and dl["level"] in ("DCA", "BUY1", "BUY2"):
+        acts.append("红利低波：%s" % dl["action"])
+    elif dl.get("ok") and dl["level"] in ("TRIM", "SELL"):
+        acts.append("红利低波：%s" % dl["action"])
+    if sp.get("ok") and sp["prem"] >= 1.5:
+        acts.append("标普500：%s" % sp["action"])
     if b.get("ok") and b.get("lock"):
-        acts.append("短融：年化≥2.5%，可锁定")
+        acts.append("固收桶：年化≥2.5%，可锁定")
     if g.get("ok") and (g.get("spike") or g.get("trigger")):
         acts.append("黄金：%s" % ("减一部分" if g["spike"] else "可加"))
-    if h.get("ok") and h.get("stale"):
-        acts.append("📌 港股通红利：股息率已 **%d 天**未更新，查一次后 --set-hk-yield"
-                    % h["age"])
 
     L.append("")
     L.append("**◆ 今日动作**")
@@ -319,15 +321,14 @@ def build(d, mode):
                     L.append("· %s 现%.0f%% / 目标%.0f%%%s" %
                              (row["name"], row["cur"] * 100, row["tgt"] * 100,
                               " ⚠" if row["alert"] else ""))
-                L.append("　先用新钱补低配，尽量不卖高配")
+                L.append("\u3000先用新钱补低配，尽量不卖高配")
             else:
                 L.append("· " + (r.get("err") or "未配置"))
 
         maint = []
-        if h.get("ok") and h.get("stale"):
-            maint.append("港股通红利股息率：%d 天前录入（%s），阈值 %d 天"
-                         % (h["age"], h["asof"], C.HK_YIELD_STALE_DAYS))
-        if s.get("ok") and s.get("shiller_src") == "手动":
+        if g.get("ok") and False:
+            pass
+        if sp.get("ok") and sp.get("shiller_src") == "手动":
             maint.append("标普500 席勒PE：GuruFocus 抓取失败，当前为手动值")
         if maint:
             L.append("")
@@ -335,17 +336,20 @@ def build(d, mode):
             for x in maint:
                 L.append("· " + x)
 
-        bad = [n for k, n in (("erp", "ERP"), ("a500", "A500"), ("hk", "港股通红利"),
-                              ("sp", "标普500"), ("sb", "短融"), ("gold", "黄金"),
-                              ("dxy", "美元指数"), ("sbx", "南向资金"))
+        bad = [n for k, n in (("erp", "ERP"), ("a500", "A500"), ("div_low", "红利低波"),
+                              ("div_922", "中证红利"), ("sp", "标普500"), ("sb", "固收桶"),
+                              ("gold", "黄金"), ("dxy", "美元指数"))
                if not d[k].get("ok")]
         if bad:
             L.append("")
             L.append("**◆ 数据异常**：%s（显示「—」，其余不受影响）" % "、".join(bad))
         L.append("")
         L.append("---")
-        L.append("*五个标的锚不同：估值分位 / 股息利差 / 溢价率 / 资金面 / 实际利率*")
-        L.append("*指标只回答「买多少」，不回答「何时涨」*")
+        utc = (now - timedelta(hours=8)).strftime("%m-%d %H:%M")
+        L.append("*执行 %s 北京 / %s UTC ｜ 触发：%s*" %
+                 (now.strftime("%m-%d %H:%M"), utc,
+                  os.environ.get("TRIGGER", "本地/未知")))
+        L.append("*六个标的锚不同：估值分位 / 均线+估值 / 溢价率 / 资金面 / 实际利率*")
 
     return "\n".join(L)
 
@@ -382,6 +386,24 @@ def main():
         hh = now.hour + now.minute / 60.0
         mode = "noon" if 11.0 <= hh < 15.0 else "night"
 
+    hh = now.hour + now.minute / 60.0
+    lo, hi = (C.SEND_WINDOW_NOON if mode == "noon" else C.SEND_WINDOW_NIGHT)
+    if not args.force and not (lo <= hh < hi):
+        print("当前北京 %.2f 点，不在 %s 推送窗口 %.1f–%.1f，跳过（--force 可强制）"
+              % (hh, "午间" if mode == "noon" else "夜间", lo, hi))
+        return 0
+
+    slot = now.strftime("%Y-%m-%d") + "-" + mode
+    prev = _read_state()
+    if prev.get("slot") == slot and not args.force:
+        try:
+            gap = (now - datetime.fromisoformat(prev["at"])).total_seconds() / 60.0
+            if gap < DEDUPE_MINUTES:
+                print("同一时段 %.0f 分钟前已推送，跳过（防重复）" % gap)
+                return 0
+        except Exception:
+            pass
+
     msg = build(gather(), mode)
     print(msg)
     if args.dry:
@@ -401,6 +423,7 @@ def main():
         else:
             resp = P.send_serverchan(os.environ.get("SERVERCHAN_KEY") or cfg.get("serverchan_key", ""),
                                      title, msg)
+        _write_state(slot, now.isoformat())
         print('{"ok": true, "resp": %s}' % resp)
     except Exception as ex:
         print('{"ok": false, "error": "%s"}' % ex)

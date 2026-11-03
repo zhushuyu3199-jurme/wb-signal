@@ -181,25 +181,36 @@ def fetch_tips10():
 
 
 def fetch_shiller_pe():
-    """GuruFocus 席勒PE（页面 meta 描述里带当前值）"""
-    import re, time
-    t = ""
+    """席勒市盈率：GuruFocus 优先（带8年预期），multpl 兜底"""
+    import re
+    # 1) GuruFocus（附未来8年预期年化）
     for _ in range(3):
         try:
-            t = _get(C.SHILLER_URL)
+            t = _get(C.SHILLER_URL, timeout=20)
             if "席勒市盈率当前值为" in t:
-                break
+                m = re.search(r"席勒市盈率当前值为\s*([\d.]+)", t)
+                if m:
+                    v = float(m.group(1))
+                    if 5 < v < 100:
+                        exp = re.search(r"未来8年年化回报率预期为\s*(-?[\d.]+)%", t)
+                        return {"value": v, "exp8": float(exp.group(1)) if exp else None,
+                                "src": "GuruFocus"}
         except Exception:
             pass
-        time.sleep(1.5)
-    m = re.search(r"席勒市盈率当前值为\s*([\d.]+)", t)
-    if not m:
-        raise ValueError("未匹配到席勒PE")
-    v = float(m.group(1))
-    if not (5 < v < 100):
-        raise ValueError("席勒PE %.1f 异常" % v)
-    exp = re.search(r"未来8年年化回报率预期为\s*(-?[\d.]+)%", t)
-    return {"value": v, "exp8": float(exp.group(1)) if exp else None}
+        time.sleep(1.2)
+
+    # 2) multpl.com（只有当前值，无预期年化）
+    try:
+        t = _get_retry("https://www.multpl.com/shiller-pe", timeout=25, tries=3)
+        m = re.search(r"Current Shiller PE Ratio[^0-9]{0,80}?([\d]+\.[\d]+)", t)
+        if m:
+            v = float(m.group(1))
+            if 5 < v < 100:
+                return {"value": v, "exp8": None, "src": "multpl"}
+    except Exception:
+        pass
+
+    raise ValueError("席勒PE 两个来源都失败")
 
 
 def fetch_fx(code):
@@ -222,35 +233,14 @@ def calc_dxy():
     if not (60 < v < 160):
         raise ValueError("美元指数 %.1f 异常" % v)
     if v >= 102:
-        zone = "强势·压制金价"
+        zone = "强势，压制金价"
     elif v >= 98:
         zone = "中性偏强"
     elif v >= 95:
         zone = "中性偏弱"
     else:
-        zone = "弱势·利好金价"
+        zone = "弱势，利好金价"
     return {"value": v, "zone": zone}
-
-
-def calc_southbound(days=5):
-    """南向资金：东财沪深港通历史，MUTUAL_TYPE=006 为南向合计，单位百万元"""
-    url = ("https://datacenter-web.eastmoney.com/api/data/v1/get?"
-           "reportName=RPT_MUTUAL_DEAL_HISTORY&columns=ALL&pageSize=200"
-           "&sortColumns=TRADE_DATE&sortTypes=-1")
-    d = json.loads(_get(url, referer="https://data.eastmoney.com/"))
-    rows = [r for r in d["result"]["data"]
-            if r.get("MUTUAL_TYPE") == "006" and r.get("NET_DEAL_AMT") is not None]
-    if not rows:
-        raise ValueError("南向资金无数据")
-    vals = [float(r["NET_DEAL_AMT"]) / 100.0 for r in rows[:days]]  # 百万→亿
-    streak = 0
-    for v in vals:
-        if v > 0:
-            streak += 1
-        else:
-            break
-    return {"sum": sum(vals), "last": vals[0], "days": len(vals),
-            "streak_buy": streak, "date": rows[0]["TRADE_DATE"][:10]}
 
 
 def fetch_fund_navs(fund_code, n=15):
@@ -331,6 +321,8 @@ def calc_div_index(cfg, bond_cn=None):
         dates = [x["d"] for x in rows]
         from ma250_monitor import signal_for
         sig = signal_for(closes, dates, label=cfg["code"])
+        if sig.get("pct") is None or "level" not in sig:
+            raise ValueError("日线只有 %d 根，不足 250 根，无法计算年线" % len(closes))
         eva = fetch_index_eva(cfg["eva"])
         if not eva:
             raise ValueError("估值取不到")
@@ -465,7 +457,7 @@ def calc_sp500(quote):
         r["shiller"], r["shiller_src"], r["exp8"] = sh.get("value"), "手动", None
         try:
             sp = fetch_shiller_pe()
-            r["shiller"], r["shiller_src"], r["exp8"] = sp["value"], "GuruFocus", sp.get("exp8")
+            r["shiller"], r["shiller_src"], r["exp8"] = sp["value"], sp["src"], sp.get("exp8")
         except Exception:
             pass
     except Exception as e:
@@ -525,7 +517,7 @@ def calc_gold():
         label = band_lower(tips["value"], C.GOLD["tips_bands"], 1)
         conflict = (tips["value"] >= 2.0 and dd <= -25.0)
         if conflict:
-            label = "信号冲突：利率压制 vs 深度回撤（需人工判断）"
+            label = "两个信号打架：利率高说该跌，但已跌够深说该涨，自己判断"
         trigger = (tips["chg20"] <= -0.20) and (dd <= -15.0)
         r.update(ok=True, tips=tips["value"], tips_date=tips["date"],
                  tips_chg20=tips["chg20"], label=label, price=price,

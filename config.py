@@ -152,5 +152,17 @@ HOLDINGS = {"a500": None, "div_low": None, "sp500": None, "short_bond": None, "g
 
 PUSH_TITLE_PREFIX = "定盘"
 PUSH_HOURS = [12.0, 22.0]
+
+# ── 补发机制（应对 GitHub 定时任务延迟数小时）
+# 目标时点：12:00 / 22:00。若运行晚于目标，只要没超过 LATE_TOLERANCE_MIN，
+# 就当作准点；超过则照发但标题标「（补发）」，内容里的执行时间会显示真实时刻。
+SLOT_NOON_HOUR = 12
+SLOT_NIGHT_HOUR = 22
+SLOT_LOOKBACK_H = 14        # 回看多久内未发的期数可以补
+LATE_TOLERANCE_MIN = 45     # 晚超过多少分钟算「补发」
+QUIET_FROM = 23.0           # 静默时段起点（含）
+QUIET_TO = 7.0              # 静默时段终点（不含）
+
+# 旧的时间窗配置，保留但不参与判断
 SEND_WINDOW_NOON = (11.0, 14.5)
 SEND_WINDOW_NIGHT = (21.0, 23.99)

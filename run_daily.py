@@ -11,7 +11,7 @@
   python run_daily.py --set-shiller 36.2  # 录入标普500 席勒PE
 """
 import argparse, json, os, sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -68,18 +68,21 @@ def gather():
     def safe(fn, *a):
         try:
             r = fn(*a)
-            r["ok"] = True
-            return r
         except Exception as ex:
             return {"ok": False, "err": "%s: %s" % (type(ex).__name__, ex)}
+        if isinstance(r, dict):
+            r.setdefault("ok", True)
+            return r
+        return {"ok": True, "value": r}
 
+    sp_quote = get("sp500")
     return {
         "erp": erp,
         "a500": I.calc_a500(),
         "div_low": I.calc_div_index(C.DIV_LOW, erp.get("bond") if erp.get("ok") else None),
         "div_922": I.calc_div_index(C.DIV_922, erp.get("bond") if erp.get("ok") else None),
         "us10y": us10y,
-        "sp": I.calc_sp500(get("sp500")) if get("sp500") else {"ok": False, "err": "无行情"},
+        "sp": I.calc_sp500(sp_quote) if sp_quote else {"ok": False, "err": "无行情"},
         "sb": I.calc_short_bond(),
         "gold": I.calc_gold(),
         "reb": I.calc_rebalance(),
@@ -88,7 +91,6 @@ def gather():
 
 
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_state.json")
-DEDUPE_MINUTES = 40
 
 
 def _read_state():
@@ -99,12 +101,77 @@ def _read_state():
         return {}
 
 
-def _write_state(slot, when_iso):
+# PushPlus 返回码对照（用于日志判读）
+PUSHPLUS_CODE_CN = {
+    200: "受理成功",
+    903: "用户token无效（Secret 里的 token 过期或填错）",
+    999: "token 为空（Secret 未配置或变量名不是 PUSHPLUS_TOKEN）",
+    900: "请求过于频繁",
+    901: "参数错误",
+    902: "配额已用尽",
+}
+
+
+def _check_resp(resp, channel="pushplus"):
+    """PushPlus 用 code=200 表示受理；ServerChan 用 code=0。
+    以前这里不校验，903 也会打印 ok:true，导致工作流全绿但没消息。"""
+    try:
+        j = json.loads(resp)
+    except Exception:
+        return False, None, "返回不是 JSON: %s" % str(resp)[:120]
+    code = j.get("code")
+    if channel == "serverchan":
+        if code == 0:
+            return True, code, ""
+        return False, code, "ServerChan 拒绝(code=%s)：%s" % (
+            code, j.get("message") or j.get("msg") or "未知错误")
+    if code == 200:
+        return True, code, ""
+    msg = PUSHPLUS_CODE_CN.get(code) or j.get("msg") or j.get("data") or "未知错误"
+    return False, code, "PushPlus 拒绝(code=%s)：%s" % (code, msg)
+
+
+def _load_slots():
+    """已发送的时段清单，形如 {"2026-11-03-noon": "iso时间"}"""
+    st = _read_state()
+    if isinstance(st.get("slots"), dict):
+        return dict(st["slots"])
+    if st.get("slot"):                      # 兼容旧格式
+        return {st["slot"]: st.get("at", "")}
+    return {}
+
+
+def _save_slot(slot, when_iso):
+    slots = _load_slots()
+    slots[slot] = when_iso
+    cutoff = (I.now_bj().date() - timedelta(days=10)).isoformat()
+    slots = {k: v for k, v in slots.items() if k[:10] >= cutoff}
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"slot": slot, "at": when_iso}, f, ensure_ascii=False)
+            json.dump({"slots": slots}, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
+
+
+def _pick_slot(now):
+    """挑出「已到点但还没发」的那一期，允许回看 14 小时。
+    GitHub 定时任务常延迟数小时，这样即使晚到也能把漏掉的那期补上，
+    而不是像旧逻辑那样整期静默丢弃。"""
+    sent = _load_slots()
+    cands = []
+    for back in (0, 1):
+        d = (now - timedelta(days=back)).date()
+        for name, hour in (("noon", C.SLOT_NOON_HOUR), ("night", C.SLOT_NIGHT_HOUR)):
+            t = now.replace(year=d.year, month=d.month, day=d.day,
+                            hour=hour, minute=0, second=0, microsecond=0)
+            if t <= now and (now - t) <= timedelta(hours=C.SLOT_LOOKBACK_H):
+                cands.append((t, "%s-%s" % (d.isoformat(), name), name))
+    # 取最新的那一期：若积压了两期（如昨夜被静默跳过），补最新的，陈旧的那期直接丢弃，
+    # 避免出现「今天 12:00 却在发昨天的夜间版」这种一天接一天的错位。
+    for t, slot, name in sorted(cands, reverse=True):
+        if slot not in sent:
+            return slot, name, t
+    return None, None, None
 
 
 def legacy_blocks():
@@ -191,8 +258,8 @@ def div_lines(tag, cfg, x, weighted):
     return L
 
 
-def build(d, mode):
-    now = I.now_bj()
+def build(d, mode, now=None):
+    now = now or I.now_bj()
     night = (mode == "night")
     L = []
     L.append("**%s · %s**\u3000%s" % (C.PUSH_TITLE_PREFIX,
@@ -366,8 +433,6 @@ def build(d, mode):
                 L.append("· " + (r.get("err") or "未配置"))
 
         maint = []
-        if g.get("ok") and False:
-            pass
         if sp.get("ok") and sp.get("shiller_src") == "手动":
             maint.append("标普500 席勒PE：GuruFocus 抓取失败，当前为手动值")
         if maint:
@@ -418,56 +483,73 @@ def main():
         return 0
 
     now = I.now_bj()
+    hh = now.hour + now.minute / 60.0
+
     if now.weekday() >= 5 and not args.force:
         print("周末休市，跳过（--force 强制）")
         return 0
 
-    mode = args.mode
-    if mode == "auto":
-        hh = now.hour + now.minute / 60.0
-        mode = "noon" if 11.0 <= hh < 15.0 else "night"
+    late = False
+    mark_slot = True
+    if args.force:
+        mode = args.mode
+        if mode == "auto":
+            # 手动测试时的版式：15:00 之前算午间，之后算夜间
+            mode = "noon" if hh < 15.0 else "night"
+        slot = now.strftime("%Y-%m-%d") + "-" + mode
+        # 强制运行若正好踩在目标时点（±45 分钟），才占用该时段，用来挡掉随后迟到的那次定时；
+        # 其他时间的手动测试不占用，否则上午 10 点跑一次会把「夜间」标记成已发，晚上 22:00 就被跳过。
+        tgt_hour = C.SLOT_NOON_HOUR if mode == "noon" else C.SLOT_NIGHT_HOUR
+        tgt = now.replace(hour=tgt_hour, minute=0, second=0, microsecond=0)
+        mark_slot = abs((now - tgt).total_seconds()) <= C.LATE_TOLERANCE_MIN * 60
+    else:
+        slot, mode, target = _pick_slot(now)
+        if slot is None:
+            print("当前没有「已到点且未发送」的时段，跳过（--force 可强制再发）")
+            return 0
+        if hh >= C.QUIET_FROM or hh < C.QUIET_TO:
+            print("当前北京 %.2f 点处于静默时段（%.0f:00–%.0f:00），"
+                  "延迟到的运行不补发，跳过" % (hh, C.QUIET_FROM, C.QUIET_TO))
+            return 0
+        gap_min = (now - target).total_seconds() / 60.0
+        late = gap_min > C.LATE_TOLERANCE_MIN
+        if late:
+            print("[补发] 目标 %s，实际 %s，晚 %.0f 分钟"
+                  % (target.strftime("%m-%d %H:%M"), now.strftime("%m-%d %H:%M"), gap_min))
 
-    hh = now.hour + now.minute / 60.0
-    lo, hi = (C.SEND_WINDOW_NOON if mode == "noon" else C.SEND_WINDOW_NIGHT)
-    if not args.force and not (lo <= hh < hi):
-        print("当前北京 %.2f 点，不在 %s 推送窗口 %.1f–%.1f，跳过（--force 可强制）"
-              % (hh, "午间" if mode == "noon" else "夜间", lo, hi))
-        return 0
-
-    slot = now.strftime("%Y-%m-%d") + "-" + mode
-    prev = _read_state()
-    if prev.get("slot") == slot and not args.force:
-        try:
-            gap = (now - datetime.fromisoformat(prev["at"])).total_seconds() / 60.0
-            if gap < DEDUPE_MINUTES:
-                print("同一时段 %.0f 分钟前已推送，跳过（防重复）" % gap)
-                return 0
-        except Exception:
-            pass
-
-    msg = build(gather(), mode)
+    msg = build(gather(), mode, now)
     print(msg)
     if args.dry:
         return 0
 
-    title = "%s %s %s" % (C.PUSH_TITLE_PREFIX, "午间" if mode == "noon" else "夜间",
-                          now.strftime("%m-%d"))
+    title = "%s %s %s%s" % (C.PUSH_TITLE_PREFIX, "午间" if mode == "noon" else "夜间",
+                            now.strftime("%m-%d"), "（补发）" if late else "")
     try:
         cfg = P.load_config()
         ch = cfg.get("channel", "pushplus")
         if ch == "pushplus":
             token = os.environ.get("PUSHPLUS_TOKEN") or cfg.get("pushplus_token", "")
+            src = "Secret" if os.environ.get("PUSHPLUS_TOKEN") else "本地配置"
             if not token:
-                print('{"ok": false, "error": "缺少 PUSHPLUS_TOKEN"}')
+                print('{"ok": false, "error": "缺少 PUSHPLUS_TOKEN（Secret 未配置）"}')
                 return 2
-            resp = P.send_pushplus(token, title, msg)
+            # 回显 token 后 4 位，便于和本地对比是否同一枚
+            print("[push] channel=pushplus 来源=%s token=...%s 长度=%d 主机=www.pushplus.plus"
+                  % (src, token[-4:], len(token)))
+            resp = P.send_pushplus(token, title, msg, channel=cfg.get("pushplus_channel"))
         else:
             resp = P.send_serverchan(os.environ.get("SERVERCHAN_KEY") or cfg.get("serverchan_key", ""),
                                      title, msg)
-        _write_state(slot, now.isoformat())
+
+        ok, code, detail = _check_resp(resp, ch)
+        if not ok:
+            print('{"ok": false, "code": %s, "error": "%s", "raw": %s}' % (code, detail, resp))
+            return 1
+        if mark_slot:
+            _save_slot(slot, now.isoformat())
         print('{"ok": true, "resp": %s}' % resp)
     except Exception as ex:
-        print('{"ok": false, "error": "%s"}' % ex)
+        print('{"ok": false, "error": "%s: %s"}' % (type(ex).__name__, ex))
         return 1
     return 0
 

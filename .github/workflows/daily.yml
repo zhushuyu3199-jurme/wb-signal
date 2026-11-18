@@ -9,9 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "强制运行（忽略周末休市，手动测试用）"
+        description: "强制运行（忽略周末休市与去重，仅在网页手动测试时勾选）"
         type: boolean
-        default: true
+        # 必须是 false：外部定时器用 API 触发且不传 inputs 时，GitHub 会套用这里的默认值。
+        # 若默认 true，每次定时触发都会自动带上 --force，跳过周末/静默/去重三重保护。
+        default: false
 
 permissions:
   contents: write

@@ -10,7 +10,7 @@
   python run_daily.py --set-hk-yield 5.6  # 录入港股通红利股息率
   python run_daily.py --set-shiller 36.2  # 录入标普500 席勒PE
 """
-import argparse, json, os, re, sys
+import argparse, inspect, json, os, re, sys
 from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
 import indicators as I
 import push_notify as P
+
+# 仓库里若残留旧版 push_notify.py（send_pushplus 没有 template 参数），
+# 直接传 template 会抛 TypeError，整次运行以退出码 1 失败、消息也发不出去。
+# 这里先探测签名：旧版内部本来就写死 markdown，退化成不带该参数调用即可。
+_TPL_OK = "template" in inspect.signature(P.send_pushplus).parameters
 
 
 def f1(v, s=""):
@@ -597,8 +602,14 @@ def main():
             # 用 markdown 模板：html 模板下 PushPlus 会把 <a> 剥掉，正文里的链接全部消失
             tpl = "markdown"
             body = render_md(msg)
-            resp = P.send_pushplus(token, title, body,
-                                   channel=cfg.get("pushplus_channel"), template=tpl)
+            if _TPL_OK:
+                resp = P.send_pushplus(token, title, body,
+                                       channel=cfg.get("pushplus_channel"), template=tpl)
+            else:
+                print("[warn] push_notify.py 是旧版（send_pushplus 无 template 参数），"
+                      "本次按它内置的 markdown 发送；建议把仓库里的 push_notify.py 换成本地新版")
+                resp = P.send_pushplus(token, title, body,
+                                       channel=cfg.get("pushplus_channel"))
         else:
             resp = P.send_serverchan(os.environ.get("SERVERCHAN_KEY") or cfg.get("serverchan_key", ""),
                                      title, msg)

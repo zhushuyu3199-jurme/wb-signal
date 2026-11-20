@@ -70,8 +70,8 @@ def post_form(url, payload, timeout=15):
         return resp.read().decode("utf-8")
 
 
-def send_pushplus(token, title, content, channel=None):
-    payload = {"token": token, "title": title, "content": content, "template": "markdown"}
+def send_pushplus(token, title, content, channel=None, template="markdown"):
+    payload = {"token": token, "title": title, "content": content, "template": template}
     if channel:
         payload["channel"] = channel
     last = None

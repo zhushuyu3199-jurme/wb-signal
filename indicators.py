@@ -99,9 +99,32 @@ def fetch_kline(code, n=300):
     out = []
     for r in rows:
         try:
-            out.append({"d": r[0], "c": float(r[2]), "h": float(r[3]), "l": float(r[4])})
+            out.append({"d": r[0], "c": float(r[2]), "h": float(r[3]), "l": float(r[4]),
+                        "v": float(r[5]) if len(r) > 5 and r[5] else 0.0})
         except (ValueError, IndexError):
             continue
+    return out
+
+
+def fetch_kline_em(secid):
+    """东财指数日线，带成交量。用于腾讯拿不到日线的指数（如 H30269）"""
+    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s"
+           "&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57"
+           "&klt=101&fqt=1&beg=20040101&end=20500101" % secid)
+    d = json.loads(_get_retry(url, referer="https://quote.eastmoney.com/"))
+    data = d.get("data") or {}
+    out = []
+    for line in data.get("klines") or []:
+        p = line.split(",")
+        if len(p) < 6:
+            continue
+        try:
+            out.append({"d": p[0], "c": float(p[2]), "h": float(p[3]),
+                        "l": float(p[4]), "v": float(p[5])})
+        except ValueError:
+            continue
+    if not out:
+        raise ValueError("东财日线为空: %s" % secid)
     return out
 
 
@@ -254,6 +277,192 @@ def fetch_fund_navs(fund_code, n=15):
         except (KeyError, ValueError):
             continue
     return out
+
+
+# ══ 红利三层：赔率 / 位置 / 拥挤
+
+def fetch_bond_10y_hist(refresh=True):
+    """10 年期国债全历史（日频）。首次拉 9 页写缓存，之后每天只补第 1 页。"""
+    path = os.path.join(BASE, C.BOND_HIST_CACHE)
+    hist = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                hist = json.load(f)
+        except Exception:
+            hist = {}
+    pages = 9 if len(hist) < 500 or refresh else 1
+    for pn in range(1, pages + 1):
+        u = ("https://datacenter-web.eastmoney.com/api/data/v1/get?"
+             "reportName=RPTA_WEB_TREASURYYIELD&columns=ALL&pageSize=500&pageNumber=%d"
+             "&sortColumns=SOLAR_DATE&sortTypes=-1" % pn)
+        try:
+            d = json.loads(_get_retry(u, referer="https://data.eastmoney.com/"))
+        except Exception:
+            break
+        data = (d.get("result") or {}).get("data") or []
+        if not data:
+            break
+        for r in data:
+            v = r.get(C.BOND_YIELD_FIELD)
+            if isinstance(v, (int, float)):
+                hist[r["SOLAR_DATE"][:10]] = float(v)
+        if pn > 1 and len(data) < 500:
+            break
+    if not hist:
+        raise ValueError("10Y 历史为空")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False)
+    except Exception:
+        pass
+    return hist
+
+
+def fetch_div_yield_series(code=None):
+    """红利股息率历史（季度，成分中位口径）。返回 [(日期, 股息率)]"""
+    code = code or C.DIV_YIELD_SERIES
+    t = _get("https://cheesett.zscf.co/api/v4/index/cashDividend/%s" % code,
+             referer="https://stock.cheesefortune.com/", timeout=25)
+    tab = (json.loads(t).get("datas") or {}).get("tab1") or []
+    out = []
+    for r in tab:
+        y = (r.get("field1") or {}).get("y1")
+        if y is None:
+            continue
+        x = str(r["field1"]["x"])
+        out.append(("%s-%s-%s" % (x[:4], x[4:6], x[6:8]), float(y)))
+    if len(out) < 8:
+        raise ValueError("股息率历史不足")
+    return sorted(out)
+
+
+_MEMO = {}
+
+
+def _layers_odds():
+    """赔率：红利股息率 − 10Y 国债，并给出历史分位（同一次运行内复用）"""
+    if "odds" in _MEMO:
+        return _MEMO["odds"]
+    series = fetch_div_yield_series()
+    bond = fetch_bond_10y_hist()
+    keys = sorted(bond)
+    spreads = []
+    for d, y in series:
+        cand = [k for k in keys if k <= d]
+        if not cand:
+            continue
+        spreads.append((d, y, bond[max(cand)], y - bond[max(cand)]))
+    if not spreads:
+        raise ValueError("利差序列为空")
+    cur = spreads[-1][3]
+    vals = sorted(s[3] for s in spreads)
+    pct_all = sum(1 for v in vals if v <= cur) / len(vals) * 100
+    recent = [s[3] for s in spreads if s[0] >= "2024-01-01"]
+    pct_3y = (sum(1 for v in sorted(recent) if v <= cur) / len(recent) * 100) if recent else None
+    label, score = "中性", 0.5
+    for th, lb, sc in C.ODDS_BANDS:
+        if cur >= th:
+            label, score = lb, sc
+            break
+    out = {"spread": cur, "pct_all": pct_all, "pct_3y": pct_3y,
+           "median": vals[len(vals) // 2], "n": len(vals),
+           "yld": spreads[-1][1], "bond": spreads[-1][2],
+           "label": label, "score": score, "date": spreads[-1][0]}
+    _MEMO["odds"] = out
+    return out
+
+
+def _layers_pos_crowd(cfg):
+    if cfg.get("em"):
+        rows = fetch_kline_em(cfg["em"])
+    else:
+        rows, _src = fetch_kline_any(cfg["px"], 2000)
+    rows = sorted(rows, key=lambda r: r["d"])
+    if len(rows) < 300:
+        raise ValueError("日线不足 300 根")
+    c = [r["c"] for r in rows]
+    v = [r.get("v") or 0.0 for r in rows]
+    n = len(c)
+    ma = [sum(c[i - 249:i + 1]) / 250 for i in range(249, n)]
+    dev = (c[-1] / ma[-1] - 1) * 100
+    slope = (ma[-1] / ma[-21] - 1) * 100 if len(ma) > 21 else 0.0
+
+    idx = {r["d"]: r.get("v") or 0.0 for r in rows}
+    if "bench" not in _MEMO:
+        _MEMO["bench"] = fetch_kline("sh000985", 2000)
+    bench = _MEMO["bench"]
+    bvol = {r["d"]: r["v"] for r in bench}
+    ratio = []
+    for d in sorted(set(idx) & set(bvol)):
+        if idx[d] > 0 and bvol[d] > 0:
+            ratio.append(idx[d] / bvol[d])
+    crowd = None
+    cpct = None
+    if len(ratio) >= 60:
+        ma20 = sum(ratio[-20:]) / 20.0
+        crowd = ma20
+        cpct = sum(1 for x in ratio if x <= ma20) / len(ratio) * 100
+
+    if dev < -10:
+        pzone = "深度破位"
+    elif dev < -5:
+        pzone = "年线下方较深"
+    elif dev < 0:
+        pzone = "年线附近偏下"
+    elif dev < 5:
+        pzone = "年线附近偏上"
+    elif dev < 15:
+        pzone = "高于年线较多"
+    else:
+        pzone = "远高于年线"
+    if slope < -0.3:
+        strend = "年线下行"
+    elif slope > 0.3:
+        strend = "年线上行"
+    else:
+        strend = "年线走平"
+    return {"dev": dev, "slope": slope, "zone": pzone, "trend": strend,
+            "crowd": crowd, "crowd_pct": cpct,
+            "crowd_n": len(ratio), "close": c[-1], "src_n": n}
+
+
+def calc_div_layers(cfg):
+    """红利指数三层：赔率（利差）/ 位置（偏离+斜率）/ 拥挤（成交额占比）"""
+    r = {"ok": False, "err": None}
+    try:
+        odds = _layers_odds()
+        pc = _layers_pos_crowd(cfg)
+        cp = pc["crowd_pct"]
+        if cp is None:
+            clabel = "—"
+        elif cp < C.CROWD_BANDS[0]:
+            clabel = "低"
+        elif cp < C.CROWD_BANDS[1]:
+            clabel = "中低"
+        elif cp < C.CROWD_BANDS[2]:
+            clabel = "中高"
+        else:
+            clabel = "高"
+
+        # 合成：赔率定方向，拥挤否决加仓，位置做确认
+        if odds["score"] <= 0.2:
+            act = "不加仓，新钱优先给别的资产"
+        elif cp is not None and cp >= C.CROWD_BANDS[2]:
+            act = "持有，不加仓（拥挤度过高）"
+        elif pc["dev"] >= 5:
+            act = "持有，等回落再加"
+        elif odds["score"] >= 0.8 and (cp is None or cp < C.CROWD_BANDS[1]):
+            act = "可以加仓"
+        elif pc["dev"] < -5 and pc["trend"] != "年线下行":
+            act = "可以分批接"
+        else:
+            act = "持有，按计划定投"
+
+        r.update(ok=True, odds=odds, **pc, crowd_label=clabel, action=act)
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
 
 
 # ══ 分档工具
@@ -523,6 +732,73 @@ def calc_gold():
                  tips_chg20=tips["chg20"], label=label, price=price,
                  dd=dd, chg60=chg60, trigger=trigger, conflict=conflict,
                  spike=(chg60 >= C.GOLD["spike_cut"]))
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def calc_gold_rmb():
+    """沪金主力连续（元/克）。只做位置参考：现价 + 到各分割位还差多少。"""
+    r = {"ok": False, "err": None}
+    try:
+        txt = _get("https://hq.sinajs.cn/list=%s" % C.GOLD_RMB["sina"],
+                   referer="https://finance.sina.com.cn/", encoding="gbk")
+        f = txt.split('"')[1].split(",")
+        last = float(f[8])
+        prev = float(f[10])
+        if last <= 0:                      # 集合竞价或停牌时最新价可能为 0
+            last = float(f[7]) or prev
+        if last <= 0:
+            raise ValueError("沪金最新价为空")
+        lv = [{"level": L, "diff": L - last, "pct": (L / last - 1) * 100}
+              for L in C.GOLD_RMB["levels"]]
+        r.update(ok=True, price=last, prev_settle=prev,
+                 chg=((last / prev - 1) * 100) if prev else None,
+                 high=float(f[3]), low=float(f[4]),
+                 date=f[17] if len(f) > 17 else "", levels=lv)
+    except Exception as e:
+        r["err"] = "%s: %s" % (type(e).__name__, e)
+    return r
+
+
+def _ma_zone(dev):
+    if dev < -10:
+        return "深度破位"
+    if dev < -5:
+        return "年线下方较深"
+    if dev < 0:
+        return "年线附近偏下"
+    if dev < 5:
+        return "年线附近偏上"
+    if dev < 15:
+        return "高于年线较多"
+    return "远高于年线"
+
+
+def calc_star50():
+    """科创综指 000680：点位 + 年线位置/斜率 + 到关注位的距离。"""
+    r = {"ok": False, "err": None}
+    try:
+        rows = sorted(fetch_kline(C.STAR50["sina"], 400), key=lambda x: x["d"])
+        if len(rows) < 300:
+            raise ValueError("日线不足 300 根")
+        c = [x["c"] for x in rows]
+        ma = [sum(c[i - 249:i + 1]) / 250 for i in range(249, len(c))]
+        dev = (c[-1] / ma[-1] - 1) * 100
+        slope = (ma[-1] / ma[-21] - 1) * 100 if len(ma) > 21 else 0.0
+        price, chg = c[-1], None
+        try:
+            q = fetch_quotes([C.STAR50["sina"]]).get(C.STAR50["code"])
+            if q:
+                price, chg = q["price"], q["chg"]
+        except Exception:
+            pass
+        L = C.STAR50["level"]
+        r.update(ok=True, price=price, chg=chg, ma250=ma[-1],
+                 dev=dev, slope=slope, zone=_ma_zone(dev),
+                 trend="年线上行" if slope > 0.3 else ("年线下行" if slope < -0.3 else "年线走平"),
+                 level=L, diff=L - price, pct=(L / price - 1) * 100,
+                 date=rows[-1]["d"])
     except Exception as e:
         r["err"] = "%s: %s" % (type(e).__name__, e)
     return r

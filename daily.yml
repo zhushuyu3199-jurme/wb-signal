@@ -1,0 +1,63 @@
+name: Portfolio Monitor
+
+on:
+  schedule:
+    # 北京时间 12:00 = UTC 04:00
+    - cron: "0 4 * * 1-5"
+    # 北京时间 22:00 = UTC 14:00
+    - cron: "0 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制运行（忽略周末休市与去重，仅在网页手动测试时勾选）"
+        type: boolean
+        # 必须是 false：外部定时器用 API 触发且不传 inputs 时，GitHub 会套用这里的默认值。
+        # 若默认 true，每次定时触发都会自动带上 --force，跳过周末/静默/去重三重保护。
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 运行组合监测
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          TRIGGER: ${{ github.event_name }}
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
+          FORCE_INPUT: ${{ github.event.inputs.force }}
+        run: |
+          # --force 只在「界面上勾了强制」时加。
+          # 外部定时器用 API 触发时不传 inputs，FORCE_INPUT 为空 -> 走正常时段判定
+          # （周末休市跳过、静默时段跳过、send_state 去重），这样才能和 schedule 互不重复。
+          FORCE=""
+          if [ "$TRIGGER" = "workflow_dispatch" ] && [ "$FORCE_INPUT" = "true" ]; then
+            FORCE="--force"
+          fi
+          echo "[trigger] event=$TRIGGER force_input=[$FORCE_INPUT] args=[$FORCE]"
+          python run_daily.py --mode auto $FORCE
+
+      - name: 回写数据（分红库/净值库/手动值）
+        run: |
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无变化"
+          else
+            git commit -m "data update: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
